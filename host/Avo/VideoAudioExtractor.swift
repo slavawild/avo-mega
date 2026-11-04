@@ -17,11 +17,33 @@ enum VideoAudioExtractor {
     /// Interleaved stereo S16LE.
     nonisolated static let frameBytes = 4
 
+    /// Copies a movie the user chose into Avo's own folder (Application
+    /// Support/Avo/CameraVideos), where the daemon can read it for good: the
+    /// chosen URL may be a passing security-scoped grant. Then makes its
+    /// soundtrack sidecar. Returns the copy's path, and a note for the user
+    /// when its sound cannot be the microphone (the camera works anyway).
+    /// Copying a long movie takes a while: run it off the main actor.
+    nonisolated static func importMovie(_ url: URL) async throws -> (path: String, note: String?) {
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+        let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appending(path: "Avo/CameraVideos", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let destination = folder.appending(path: UUID().uuidString + "." + url.pathExtension.lowercased())
+        try FileManager.default.copyItem(at: url, to: destination)
+        do {
+            let sound = try await createSidecar(for: destination)
+            return (destination.path, sound ? nil : "This video has no usable audio track; the video camera will still work.")
+        } catch {
+            return (destination.path, error.localizedDescription)
+        }
+    }
+
     /// Returns false when the movie has no sound track; the camera still works.
-    nonisolated static func createSidecar(for video: URL) throws -> Bool {
+    nonisolated static func createSidecar(for video: URL) async throws -> Bool {
         let asset = AVURLAsset(url: video)
-        guard let track = asset.tracks(withMediaType: .audio).first else { return false }
-        let duration = asset.duration
+        guard let track = try await asset.loadTracks(withMediaType: .audio).first else { return false }
+        let duration = try await asset.load(.duration)
         guard duration.isNumeric, duration.seconds > 0 else { return false }
         let totalFrames = frames(at: duration)
         guard totalFrames > 0 else { return false }

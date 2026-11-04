@@ -1142,35 +1142,30 @@ struct CameraPicker: View {
         Button("Choose video file…") { importingVideo = true }
             .disabled(processingVideo)
             .fileImporter(isPresented: $importingVideo, allowedContentTypes: [.mpeg4Movie, .movie]) { result in
+                let url: URL
                 do {
-                    let url = try result.get()
-                    let accessed = url.startAccessingSecurityScopedResource()
-                    defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-                    let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                        .appending(path: "Avo/CameraVideos", directoryHint: .isDirectory)
-                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-                    // Copy to a stable path that the separate Avo daemon can read.
-                    // The imported URL may be a temporary security-scoped grant.
-                    let destination = folder.appending(path: UUID().uuidString + "." + url.pathExtension.lowercased())
-                    try FileManager.default.copyItem(at: url, to: destination)
-                    // Decode on a worker. Only activate the new source once
-                    // the matching PCM sidecar is ready for the engine.
-                    processingVideo = true
-                    Task {
-                        let outcome = await Task.detached(priority: .userInitiated) {
-                            () -> (Bool, String?) in
-                            do {
-                                return (try VideoAudioExtractor.createSidecar(for: destination), nil)
-                            } catch {
-                                return (false, error.localizedDescription)
-                            }
-                        }.value
-                        selection = .video(destination.path)
-                        processingVideo = false
-                        videoImportError = outcome.1 ?? (outcome.0 ? nil : "This video has no usable audio track; the video camera will still work.")
-                    }
+                    url = try result.get()
                 } catch {
                     videoImportError = error.localizedDescription
+                    return
+                }
+                // Copying and decoding a long movie take a while: off the
+                // main actor, so the Control Panel stays responsive. The new
+                // source is chosen once its PCM sidecar is ready for the engine.
+                processingVideo = true
+                videoImportError = nil
+                Task {
+                    let outcome = await Task.detached(priority: .userInitiated) {
+                        try await VideoAudioExtractor.importMovie(url)
+                    }.result
+                    processingVideo = false
+                    switch outcome {
+                    case .success(let movie):
+                        selection = .video(movie.path)
+                        videoImportError = movie.note
+                    case .failure(let error):
+                        videoImportError = error.localizedDescription
+                    }
                 }
             }
         if processingVideo {
