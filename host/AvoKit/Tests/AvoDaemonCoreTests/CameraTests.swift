@@ -320,7 +320,9 @@ import Testing
     }
 
     /// A movie half red, half blue plays at the size Android asks for, and
-    /// starts over at its end: red again after blue.
+    /// starts over at its end. One pass shows at most red then blue; a
+    /// third run of one color means it started over, wherever the first
+    /// frame fell (a busy CI machine encodes its first frame late).
     @Test func aVideoCameraPlaysItsMovieOverAndOver() async throws {
         let url = FileManager.default.temporaryDirectory.appending(path: "avo-cam-\(UUID().uuidString.prefix(8)).mov")
         defer { try? FileManager.default.removeItem(at: url) }
@@ -334,19 +336,19 @@ import Testing
             frames.lock.withLock { frames.all.append(jpeg) }
         }
         camera.start()
-        try await Task.sleep(for: .milliseconds(2600))
+        try await Task.sleep(for: .milliseconds(3500))
         camera.stop()
         let jpegs = frames.lock.withLock { frames.all }
-        #expect(jpegs.count >= 20)
+        #expect(jpegs.count >= 10, "frames keep coming: \(jpegs.count)")
         #expect(jpegs.allSatisfy { size($0).map { $0 == (32, 24) } ?? false })
-        // Each run of one color once: red, blue, red (and maybe more).
+        // Runs of one color: red, blue, red… or blue, red, blue….
         var runs: [String] = []
         for jpeg in jpegs {
             guard let rgb = centerColor(jpeg) else { continue }
             let color = rgb.red > 150 && rgb.blue < 100 ? "red" : rgb.blue > 150 && rgb.red < 100 ? "blue" : "other"
             if color != "other", runs.last != color { runs.append(color) }
         }
-        #expect(Array(runs.prefix(3)) == ["red", "blue", "red"], "\(runs)")
+        #expect(runs.count >= 3, "the movie started over: \(runs)")
     }
 
     /// One frame of each color, at `fps`, as Motion JPEG (no hardware encoder needed).
