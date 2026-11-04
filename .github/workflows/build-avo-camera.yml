@@ -14,6 +14,11 @@ on:
 permissions:
   contents: read
 
+# Keep only the newest test build while the branch is being developed.
+concurrency:
+  group: avo-mp4-camera-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build for Apple Silicon
