@@ -135,6 +135,8 @@ public final class CameraFeed: @unchecked Sendable {
             producer = DrawnCamera(.scene(camera: camera), request: request, deliver: deliver)
         case .mac(let id):
             producer = macCamera(id, camera: camera, request: request, deliver: deliver)
+        case .video(let path):
+            producer = FileVideoCamera(path: path, request: request, deliver: deliver)
         }
         logger.notice("camera \(camera, privacy: .public): \(request.width)×\(request.height) at \(request.fps) fps from \(self.sources[camera].rawValue, privacy: .public)")
         producers[camera] = producer
@@ -312,6 +314,66 @@ final class MacCamera: NSObject, CameraProducer, AVCaptureVideoDataOutputSampleB
         guard let pixels = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let image = JPEGEncoder.filling(CIImage(cvPixelBuffer: pixels), width: request.width, height: request.height)
         if let jpeg = encoder.jpeg(image) { deliver(jpeg) }
+    }
+}
+
+/// Loop a local video into the existing JPEG camera-feed protocol.
+/// Frames are requested at the camera's clock; the generator finds the video
+/// frame at that playback timestamp. The asset is never played with audio.
+final class FileVideoCamera: CameraProducer, @unchecked Sendable {
+    private let request: CameraFeed.Request
+    private let deliver: @Sendable (Data) -> Void
+    private let generator: AVAssetImageGenerator
+    private let duration: Double
+    private let encoder = JPEGEncoder()
+    private let timer: DispatchSourceTimer
+    private let clock = ContinuousClock()
+    private var started: ContinuousClock.Instant?
+    private var frameNumber: Int64 = 0
+
+    init(path: String, request: CameraFeed.Request, deliver: @escaping @Sendable (Data) -> Void) {
+        self.request = request
+        self.deliver = deliver
+        let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+        generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .milliseconds(25)
+        generator.requestedTimeToleranceAfter = .milliseconds(25)
+        // These properties are synchronous for compatibility with the existing
+        // CameraProducer interface. Only local, user-selected files are used.
+        duration = asset.duration.seconds
+        timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "com.avodroid.cameras.video"))
+        timer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / max(request.fps, 1)), leeway: .milliseconds(3))
+        timer.setEventHandler { [weak self] in self?.tick() }
+    }
+
+    func start() {
+        started = clock.now
+        timer.resume()
+    }
+
+    func stop() {
+        timer.cancel()
+        generator.cancelAllCGImageGeneration()
+    }
+
+    private func tick() {
+        guard let started, duration.isFinite, duration > 0 else { return }
+        // Follow elapsed time rather than counting callbacks: a slow decode
+        // drops old frames instead of gradually drifting behind real time.
+        let elapsed = started.duration(to: clock.now)
+        let seconds = Double(elapsed.components.seconds)
+            + Double(elapsed.components.attoseconds) / 1e18
+        let timestamp = seconds.truncatingRemainder(dividingBy: duration)
+        let time = CMTime(seconds: max(0, timestamp), preferredTimescale: 600)
+        do {
+            let cgImage = try generator.copyCGImage(at: time, actualTime: nil)
+            let resized = JPEGEncoder.filling(CIImage(cgImage: cgImage), width: request.width, height: request.height)
+            if let jpeg = encoder.jpeg(resized) { deliver(jpeg) }
+        } catch {
+            // Missing, corrupt or unsupported video: the VM keeps its own
+            // gray fallback, and the next frame is attempted on the next tick.
+        }
     }
 }
 
