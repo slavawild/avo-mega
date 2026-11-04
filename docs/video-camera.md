@@ -16,7 +16,7 @@ The video has no audio: it is used only as a camera source. FPS follows the Andr
 ## Known limitations
 
 - This is a first implementation. It has **not been built or exercised on a macOS machine yet**; compatibility needs validation.
-- Selecting a file **inside Android** is not implemented. That requires an Android companion UI plus a guest-to-host control/file-transfer protocol. The host picker is a separate first milestone, not a replacement for that goal.
+- Video selection is intentionally handled by the Avo macOS Control Panel. The user confirmed that an Android-side file picker is unnecessary.
 - Files are copied on each selection, but old copies are not automatically pruned.
 - Source is saved as an absolute path; if files are moved or deleted, Avo cannot decode them.
 - Invalid video files will result in the VM's ordinary gray/no-frame fallback.
