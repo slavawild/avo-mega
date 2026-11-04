@@ -934,7 +934,7 @@ enum Deadline {
                             race.finish(.failure(AvoError.timedOut(what)))
                             return
                         }
-                        try? await Task.sleep(for: min(limit, .seconds(1)), clock: .suspending)
+                        try? await Task.sleep(for: min(limit, Duration.seconds(1)), clock: .suspending)
                     }
                 })
             }
