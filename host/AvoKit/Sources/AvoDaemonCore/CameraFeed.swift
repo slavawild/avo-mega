@@ -453,8 +453,10 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
         var due: CVPixelBuffer?
         while true {
             if next == nil {
-                // At the end of the movie: the last frame stays up until the loop starts over.
-                guard let sample = output?.copyNextSampleBuffer() else { break }
+                // At the end of the movie the reader is done, and asking it
+                // again raises (its status is no longer reading): the last
+                // frame stays up until the loop starts over.
+                guard let reader, reader.status == .reading, let sample = output?.copyNextSampleBuffer() else { break }
                 next = sample
             }
             guard let sample = next else { break }

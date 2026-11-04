@@ -23,7 +23,13 @@ enum CameraVideos {
 
     /// Movies kept besides the ones a camera shows.
     static let kept = 5
-    static let movieExtensions: Set<String> = ["mp4", "m4v", "mov"]
+    /// What lies beside a movie: its soundtrack sidecar, and one being made.
+    static let sidecarExtensions: Set<String> = ["pcm", "pcm-part"]
+
+    /// A movie, not a sidecar: whatever kind the file panel let through.
+    static func isMovie(_ url: URL) -> Bool {
+        !sidecarExtensions.contains(url.pathExtension.lowercased())
+    }
 
     static var folder: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -69,10 +75,10 @@ enum CameraVideos {
             let added = values?.creationDate ?? .distantPast
             if values?.isDirectory == true {
                 let inside = (try? manager.contentsOfDirectory(at: entry, includingPropertiesForKeys: nil, options: .skipsHiddenFiles)) ?? []
-                if let movie = inside.first(where: { movieExtensions.contains($0.pathExtension.lowercased()) }) {
+                if let movie = inside.first(where: isMovie) {
                     movies.append(Movie(path: movie.path, added: added))
                 }
-            } else if movieExtensions.contains(entry.pathExtension.lowercased()) {
+            } else if isMovie(entry) {
                 // A copy from before folders of their own.
                 movies.append(Movie(path: entry.path, added: added))
             }
