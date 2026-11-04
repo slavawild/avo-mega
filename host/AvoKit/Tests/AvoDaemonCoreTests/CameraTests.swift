@@ -1,3 +1,4 @@
+@preconcurrency import AVFoundation
 import AvoIO
 import AvoKit
 import CoreImage
@@ -8,6 +9,30 @@ import Testing
 @testable import AvoDaemonCore
 
 @Suite struct CameraSettingsTests {
+    /// Whose sound Android's microphone hears: the front camera's video,
+    /// else the back one's, only with the microphone on and set to it.
+    @Test func theMicrophoneHearsTheFrontVideoFirst() {
+        let front = "/Videos/1/Front clip.mov", back = "/Videos/2/back.mp4"
+        var config = VMConfig(backCamera: .video(back), frontCamera: .video(front), microphoneVideoAudio: true)
+        #expect(config.soundtrackCamera == 1)
+        #expect(config.videoMicrophonePCMPath == "/Videos/1/Front clip.pcm")
+        #expect(VMMEngine.videoMicrophoneCommand(config) == "microphone file /Videos/1/Front clip.pcm")
+        config.frontCamera = .emulated
+        #expect(config.soundtrackCamera == 0)
+        #expect(config.videoMicrophonePCMPath == "/Videos/2/back.pcm")
+        // The Mac's microphone: set to it, with no video, with cameras off,
+        // and (as silence follows anyway) with the microphone off.
+        let changes: [(inout VMConfig) -> Void] = [{ $0.microphoneVideoAudio = false }, { $0.backCamera = .mac("0x1") },
+                                                   { $0.camerasEnabled = false }, { $0.microphoneEnabled = false }]
+        for change in changes {
+            var other = config
+            change(&other)
+            #expect(other.soundtrackCamera == nil)
+            #expect(other.videoMicrophonePCMPath == nil)
+            #expect(VMMEngine.videoMicrophoneCommand(other) == "microphone mac")
+        }
+    }
+
     @Test func sourcesAreSavedAsWords() throws {
         for source in [CameraSource.emulated, .none, .mac("0x1424000005ac8600"), .video("/tmp/test-camera.mp4")] {
             #expect(CameraSource(rawValue: source.rawValue) == source)
@@ -210,6 +235,100 @@ import Testing
             #expect(filled.extent == CGRect(x: 0, y: 0, width: width, height: height))
             #expect(size(try #require(JPEGEncoder().jpeg(filled)))! == (width, height))
         }
+    }
+
+    /// Phones record portrait movies sideways and say how to turn them.
+    @Test func phoneMoviesAreTurnedUpright() {
+        #expect(FileVideoCamera.orientation(.identity) == .up)
+        #expect(FileVideoCamera.orientation(CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 1080, ty: 0)) == .right)
+        #expect(FileVideoCamera.orientation(CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: 1920)) == .left)
+        #expect(FileVideoCamera.orientation(CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: 1920, ty: 1080)) == .down)
+    }
+
+    /// A movie half red, half blue plays at the size Android asks for, and
+    /// starts over at its end: red again after blue.
+    @Test func aVideoCameraPlaysItsMovieOverAndOver() async throws {
+        let url = FileManager.default.temporaryDirectory.appending(path: "avo-cam-\(UUID().uuidString.prefix(8)).mov")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try await Self.writeMovie(url, colors: Array(repeating: (255, 0, 0), count: 5) + Array(repeating: (0, 0, 255), count: 5), fps: 10)
+        final class Frames: @unchecked Sendable {
+            let lock = NSLock()
+            var all: [Data] = []
+        }
+        let frames = Frames()
+        let camera = FileVideoCamera(path: url.path, request: .init(width: 32, height: 24, fps: 20)) { jpeg in
+            frames.lock.withLock { frames.all.append(jpeg) }
+        }
+        camera.start()
+        try await Task.sleep(for: .milliseconds(2600))
+        camera.stop()
+        let jpegs = frames.lock.withLock { frames.all }
+        #expect(jpegs.count >= 20)
+        #expect(jpegs.allSatisfy { size($0).map { $0 == (32, 24) } ?? false })
+        // Each run of one color once: red, blue, red (and maybe more).
+        var runs: [String] = []
+        for jpeg in jpegs {
+            guard let rgb = centerColor(jpeg) else { continue }
+            let color = rgb.red > 150 && rgb.blue < 100 ? "red" : rgb.blue > 150 && rgb.red < 100 ? "blue" : "other"
+            if color != "other", runs.last != color { runs.append(color) }
+        }
+        #expect(Array(runs.prefix(3)) == ["red", "blue", "red"], "\(runs)")
+    }
+
+    /// One frame of each color, at `fps`, as Motion JPEG (no hardware encoder needed).
+    private static func writeMovie(_ url: URL, colors: [(UInt8, UInt8, UInt8)], fps: Int32, width: Int = 64, height: Int = 48) async throws {
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.jpeg, AVVideoWidthKey: width, AVVideoHeightKey: height,
+        ])
+        input.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height,
+        ])
+        writer.add(input)
+        #expect(writer.startWriting())
+        writer.startSession(atSourceTime: .zero)
+        for (index, color) in colors.enumerated() {
+            while !input.isReadyForMoreMediaData { try await Task.sleep(for: .milliseconds(5)) }
+            var created: CVPixelBuffer?
+            CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, nil, &created)
+            let pixels = try #require(created)
+            CVPixelBufferLockBaseAddress(pixels, [])
+            let base = try #require(CVPixelBufferGetBaseAddress(pixels)).assumingMemoryBound(to: UInt8.self)
+            let row = CVPixelBufferGetBytesPerRow(pixels)
+            for y in 0..<height {
+                for x in 0..<width {
+                    let pixel = base + y * row + x * 4
+                    pixel[0] = color.2
+                    pixel[1] = color.1
+                    pixel[2] = color.0
+                    pixel[3] = 255
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(pixels, [])
+            #expect(adaptor.append(pixels, withPresentationTime: CMTime(value: CMTimeValue(index), timescale: fps)))
+        }
+        input.markAsFinished()
+        writer.endSession(atSourceTime: CMTime(value: CMTimeValue(colors.count), timescale: fps))
+        await writer.finishWriting()
+        #expect(writer.status == .completed, "\(String(describing: writer.error))")
+    }
+
+    /// The color at a picture's middle.
+    private func centerColor(_ jpeg: Data) -> (red: Int, green: Int, blue: Int)? {
+        guard let source = CGImageSourceCreateWithData(jpeg as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        var pixel = [UInt8](repeating: 0, count: 4)
+        let drawn = pixel.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(data: bytes.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                          space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { return false }
+            // The middle pixel alone, not the whole picture squeezed into one.
+            context.draw(image, in: CGRect(x: -CGFloat(image.width / 2), y: -CGFloat(image.height / 2), width: CGFloat(image.width), height: CGFloat(image.height)))
+            return true
+        }
+        return drawn ? (Int(pixel[0]), Int(pixel[1]), Int(pixel[2])) : nil
     }
 
     /// A video camera says when its movie starts over (its soundtrack then
