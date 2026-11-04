@@ -1,14 +1,11 @@
 name: Build Avo MP4 Camera (macOS)
 
+# Build only the tip of this development branch. A PR event previously
+# queued obsolete snapshots of its merge ref alongside newer commits.
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - 'host/**'
-      - 'engine/**'
-      - 'scripts/**'
-      - '.github/workflows/build-avo-camera.yml'
-      - 'Makefile'
+  push:
+    branches:
+      - feature/mp4-camera-source
   workflow_dispatch:
 
 permissions:
