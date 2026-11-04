@@ -75,6 +75,8 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
     private var tasks: [Task<Void, Never>] = []
     /// The cameras the Mac feeds (CameraFeed), when Android has them.
     private var cameras: CameraFeed?
+    /// The camera whose imported video also supplies microphone audio.
+    private var soundtrackCamera: Int?
     /// The running start, and whether it booted Magisk's init_boot (RootEngine).
     private var launched: EngineLaunch?
     private var bootedWithMagisk = false
@@ -164,6 +166,13 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
     /// Control command takes the full absolute path including spaces.
     static func videoMicrophoneCommand(_ config: VMConfig) -> String {
         config.videoMicrophonePCMPath.map { "microphone file " + $0 } ?? "microphone mac"
+    }
+
+    static func soundtrackCameraIndex(_ config: VMConfig) -> Int? {
+        guard config.microphoneEnabled, config.microphoneVideoAudio, config.camerasEnabled else { return nil }
+        if config.frontCamera.videoFilePath != nil { return 1 }
+        if config.backCamera.videoFilePath != nil { return 0 }
+        return nil
     }
 
     /// "Emulate this phone's hardware": the profile's CPU for Android's
@@ -420,7 +429,13 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
                     if line.hasPrefix("bluetooth hci "), let port = line.split(separator: " ").last.flatMap({ UInt16($0) }) {
                         await agent.useBluetoothPort(port)
                     }
-                    if line.hasPrefix("camera ") { cameras?.handle(line) }
+                    if line.hasPrefix("camera ") {
+                        cameras?.handle(line)
+                        if case .on(let camera, _) = CameraFeed.parse(line),
+                           camera == self.lock.withLock({ self.soundtrackCamera }) {
+                            try? await control.send("microphone sync")
+                        }
+                    }
                     if line.hasPrefix("disk ") { self.diskFull.handle(line) }
                     bridge.handle(line)
                 }
@@ -443,6 +458,7 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
             if stops != generation { return (false, nil) }
             self.process = process
             self.cameras = cameras
+            self.soundtrackCamera = Self.soundtrackCameraIndex(launch.config)
             self.vsockPath = vsock
             self.control = control
             self.agent = agent
@@ -828,6 +844,7 @@ extension VMMEngine: DeviceSettingsEngine {
     public func applyDeviceSettings(_ config: VMConfig) async {
         let (control, agent, cameras) = lock.withLock { (self.control, self.agent, self.cameras) }
         cameras?.use(config.cameraSources)
+        lock.withLock { soundtrackCamera = Self.soundtrackCameraIndex(config) }
         try? await control?.send(Self.videoMicrophoneCommand(config))
         try? await control?.send(config.microphoneEnabled ? "microphone on" : "microphone off")
         try? await control?.send(config.networkSpeed.engineCommand)
