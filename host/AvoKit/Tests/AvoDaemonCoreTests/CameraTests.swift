@@ -9,11 +9,13 @@ import Testing
 
 @Suite struct CameraSettingsTests {
     @Test func sourcesAreSavedAsWords() throws {
-        for source in [CameraSource.emulated, .none, .mac("0x1424000005ac8600")] {
+        for source in [CameraSource.emulated, .none, .mac("0x1424000005ac8600"), .video("/tmp/test-camera.mp4")] {
             #expect(CameraSource(rawValue: source.rawValue) == source)
             #expect(try JSONDecoder().decode(CameraSource.self, from: JSONEncoder().encode(source)) == source)
         }
         #expect(CameraSource(rawValue: "mac:") == nil && CameraSource(rawValue: "webcam") == nil)
+        #expect(CameraSource(rawValue: "video:") == nil)
+        #expect(CameraSource.video("/tmp/test-camera.mp4").videoFilePath == "/tmp/test-camera.mp4")
         // A file from before cameras, or with a source this Avo does not know: emulated.
         let old = try JSONDecoder().decode(VMConfig.self, from: Data(#"{"memoryMiB": 4096, "frontCamera": "hologram"}"#.utf8))
         #expect(old.backCamera == .emulated && old.frontCamera == .emulated)
