@@ -619,6 +619,16 @@ struct SystemPane: View {
                         Text("Off, they record silence, and Avo never opens the microphone. Applies at once.")
                     }
                 }
+                if config.microphoneEnabled {
+                    Toggle("Use video soundtrack as microphone", isOn: Binding(
+                        get: { config.microphoneVideoAudio },
+                        set: { value in model.update { $0.microphoneVideoAudio = value } }
+                    ))
+                    Text("Uses audio from the selected front camera video (or back camera if no front video). Disable to use this Mac's microphone. Reopen the Android call or recording after switching.")
+                        .font(.mona(12))
+                        .foregroundStyle(Haze.textTertiary)
+                        .hazeRowNote()
+                }
             }
             .shown(sections.contains(.microphone))
             Section("Location") {
@@ -1102,6 +1112,7 @@ struct CameraPicker: View {
     @State private var looked = false
     @State private var importingVideo = false
     @State private var videoImportError: String?
+    @State private var processingVideo = false
 
     var body: some View {
         LabeledContent(title) {
@@ -1129,6 +1140,7 @@ struct CameraPicker: View {
             Task { await lookForCameras() }
         }
         Button("Choose video file…") { importingVideo = true }
+            .disabled(processingVideo)
             .fileImporter(isPresented: $importingVideo, allowedContentTypes: [.mpeg4Movie, .movie]) { result in
                 do {
                     let url = try result.get()
@@ -1141,12 +1153,30 @@ struct CameraPicker: View {
                     // The imported URL may be a temporary security-scoped grant.
                     let destination = folder.appending(path: UUID().uuidString + "." + url.pathExtension.lowercased())
                     try FileManager.default.copyItem(at: url, to: destination)
-                    selection = .video(destination.path)
-                    videoImportError = nil
+                    // Decode on a worker. Only activate the new source once
+                    // the matching PCM sidecar is ready for the engine.
+                    processingVideo = true
+                    Task {
+                        let outcome = await Task.detached(priority: .userInitiated) {
+                            () -> (Bool, String?) in
+                            do {
+                                return (try VideoAudioExtractor.createSidecar(for: destination), nil)
+                            } catch {
+                                return (false, error.localizedDescription)
+                            }
+                        }.value
+                        selection = .video(destination.path)
+                        processingVideo = false
+                        videoImportError = outcome.1 ?? (outcome.0 ? nil : "This video has no usable audio track; the video camera will still work.")
+                    }
                 } catch {
                     videoImportError = error.localizedDescription
                 }
             }
+        if processingVideo {
+            Text("Importing video and soundtrack…")
+                .font(.caption)
+        }
         if let videoImportError {
             Text(verbatim: videoImportError)
                 .foregroundStyle(.red)
