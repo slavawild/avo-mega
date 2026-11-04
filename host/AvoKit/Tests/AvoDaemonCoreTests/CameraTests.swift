@@ -237,6 +237,26 @@ import Testing
         }
     }
 
+    /// As a phone's sensor: an upright picture comes a quarter turned
+    /// counterclockwise (its top on the left), at the size Android asked
+    /// for, and the HAL says the sensor is turned that way.
+    @Test func framesComeTurnedAsAPhonesSensor() throws {
+        #expect(CameraFeed.sensorOrientation == 90)
+        #expect(GuestCamera.config.contains("<Orientation degree=\"\(CameraFeed.sensorOrientation)\"/>"))
+        // A portrait picture, red above and blue below.
+        let red = CIImage(color: .red).cropped(to: CGRect(x: 0, y: 360, width: 360, height: 360))
+        let blue = CIImage(color: .blue).cropped(to: CGRect(x: 0, y: 0, width: 360, height: 360))
+        let frame = JPEGEncoder.sensorFrame(red.composited(over: blue), width: 640, height: 480)
+        #expect(frame.extent == CGRect(x: 0, y: 0, width: 640, height: 480))
+        let jpeg = try #require(JPEGEncoder().jpeg(frame))
+        let left = try #require(color(jpeg, x: 0.15, y: 0.5)), right = try #require(color(jpeg, x: 0.85, y: 0.5))
+        #expect(left.red > 150 && left.blue < 100, "the picture's top is on the left: \(left)")
+        #expect(right.blue > 150 && right.red < 100, "its bottom on the right: \(right)")
+        // The drawn scene and notices turn the same way, at the same size.
+        let turned = try #require(DrawnCamera.draw(.notice(.missing), width: 640, height: 480, time: 0, turned: true))
+        #expect((turned.width, turned.height) == (640, 480))
+    }
+
     /// Phones record portrait movies sideways and say how to turn them.
     @Test func phoneMoviesAreTurnedUpright() {
         #expect(FileVideoCamera.orientation(.identity) == .up)
@@ -317,6 +337,11 @@ import Testing
 
     /// The color at a picture's middle.
     private func centerColor(_ jpeg: Data) -> (red: Int, green: Int, blue: Int)? {
+        color(jpeg, x: 0.5, y: 0.5)
+    }
+
+    /// The color at (`x`, `y`) of a picture, as fractions from its top left.
+    private func color(_ jpeg: Data, x: Double, y: Double) -> (red: Int, green: Int, blue: Int)? {
         guard let source = CGImageSourceCreateWithData(jpeg as CFData, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
         var pixel = [UInt8](repeating: 0, count: 4)
@@ -324,8 +349,10 @@ import Testing
             guard let context = CGContext(data: bytes.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
                                           space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
             else { return false }
-            // The middle pixel alone, not the whole picture squeezed into one.
-            context.draw(image, in: CGRect(x: -CGFloat(image.width / 2), y: -CGFloat(image.height / 2), width: CGFloat(image.width), height: CGFloat(image.height)))
+            // That pixel alone, not the whole picture squeezed into one
+            // (the context's y grows upward, the picture's rows downward).
+            let (w, h) = (CGFloat(image.width), CGFloat(image.height))
+            context.draw(image, in: CGRect(x: -(w * x).rounded(.down), y: -(h * (1 - y)).rounded(.down), width: w, height: h))
             return true
         }
         return drawn ? (Int(pixel[0]), Int(pixel[1]), Int(pixel[2])) : nil

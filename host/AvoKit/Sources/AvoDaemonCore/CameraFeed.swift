@@ -14,7 +14,8 @@ import UniformTypeIdentifiers
 /// event stream and the source chosen for it starts: one of this Mac's
 /// cameras (its light is on only while Android uses it), or a scene drawn
 /// here for an emulated one. Its frames go to avo-vmm as JPEG pictures of
-/// exactly that size (the camera's picture cropped to fill it), on a control
+/// exactly that size (the camera's picture cropped to fill it, turned as a
+/// phone's sensor is: `sensorOrientation`), on a control
 /// connection of their own (`camera feed`). `camera <index> off` stops it,
 /// and a source chosen while a camera streams takes over at once.
 ///
@@ -22,6 +23,17 @@ import UniformTypeIdentifiers
 /// one of the Mac's cameras. Until it is allowed (or while the camera chosen
 /// is gone and the Mac has none), Android sees a picture that says why.
 public final class CameraFeed: @unchecked Sendable {
+    /// How far both sensors are turned, as on a phone (GuestCamera's
+    /// `<Orientation>`): Android asks for landscape frames and apps turn them
+    /// a quarter clockwise to show them on the upright phone, and photos
+    /// say so. Every source therefore sends its upright picture turned a
+    /// quarter counterclockwise (`JPEGEncoder.sensorFrame`), so a portrait
+    /// app sees a portrait camera: a phone video fills it, photos come out
+    /// portrait. Avo's window shapes are not a turned phone to Android
+    /// (its displays keep rotation 0), so a landscape window shows the same
+    /// upright picture, cropped to its shape.
+    public static let sensorOrientation = 90
+
     /// What Android asked a camera for.
     struct Request: Equatable, Sendable {
         let width: Int
@@ -259,6 +271,17 @@ final class JPEGEncoder: @unchecked Sendable {
         context.jpegRepresentation(of: image, colorSpace: colorSpace, options: [quality: 0.8])
     }
 
+    /// An upright picture as the turned sensor gives it (CameraFeed.sensorOrientation):
+    /// filled into the portrait `height`×`width` the phone shows, then
+    /// turned a quarter counterclockwise into the `width`×`height` frame
+    /// Android asked for. Turned back a quarter clockwise, as apps do, it is
+    /// upright again.
+    static func sensorFrame(_ upright: CIImage, width: Int, height: Int) -> CIImage {
+        filling(upright, width: height, height: width)
+            .transformed(by: CGAffineTransform(translationX: CGFloat(width), y: 0).rotated(by: .pi / 2))
+            .cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
+    }
+
     /// `image` scaled to cover `width`×`height` and cropped to it, centered.
     static func filling(_ image: CIImage, width: Int, height: Int) -> CIImage {
         let extent = image.extent
@@ -289,9 +312,11 @@ final class MacCamera: NSObject, CameraProducer, AVCaptureVideoDataOutputSampleB
         super.init()
         session.beginConfiguration()
         defer { session.commitConfiguration() }
-        // The smallest common preset that holds Android's size; the picture is cropped to it.
+        // The smallest common preset that holds the portrait the phone shows
+        // (Android's size turned, JPEGEncoder.sensorFrame); the picture is
+        // cropped to it. Taller than any of them: the camera's best.
         let presets: [(AVCaptureSession.Preset, Int, Int)] = [(.vga640x480, 640, 480), (.hd1280x720, 1280, 720), (.hd1920x1080, 1920, 1080)]
-        let preset = presets.first { $0.1 >= request.width && $0.2 >= request.height && session.canSetSessionPreset($0.0) }?.0 ?? .high
+        let preset = presets.first { $0.1 >= request.height && $0.2 >= request.width && session.canSetSessionPreset($0.0) }?.0 ?? .high
         if session.canSetSessionPreset(preset) { session.sessionPreset = preset }
         let input = try AVCaptureDeviceInput(device: device)
         guard session.canAddInput(input) else { throw AvoError.internalError("\(device.localizedName) is in use") }
@@ -319,7 +344,7 @@ final class MacCamera: NSObject, CameraProducer, AVCaptureVideoDataOutputSampleB
         let interval = CMTime(value: 1, timescale: CMTimeScale(request.fps))
         due = time + CMTimeMultiplyByFloat64(interval, multiplier: 0.8)
         guard let pixels = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let image = JPEGEncoder.filling(CIImage(cvPixelBuffer: pixels), width: request.width, height: request.height)
+        let image = JPEGEncoder.sensorFrame(CIImage(cvPixelBuffer: pixels), width: request.width, height: request.height)
         if let jpeg = encoder.jpeg(image) { deliver(jpeg) }
     }
 }
@@ -470,7 +495,7 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
 
     private func encode(_ pixels: CVPixelBuffer, _ orientation: CGImagePropertyOrientation) -> Data? {
         let image = CIImage(cvPixelBuffer: pixels).oriented(orientation)
-        return encoder.jpeg(JPEGEncoder.filling(image, width: request.width, height: request.height))
+        return encoder.jpeg(JPEGEncoder.sensorFrame(image, width: request.width, height: request.height))
     }
 
     /// A track's preferred transform (how a player turns its picture
@@ -533,7 +558,7 @@ final class DrawnCamera: CameraProducer, @unchecked Sendable {
     }
 
     private func tick() {
-        guard let image = Self.draw(picture, width: request.width, height: request.height, time: Date().timeIntervalSince(started)),
+        guard let image = Self.draw(picture, width: request.width, height: request.height, time: Date().timeIntervalSince(started), turned: true),
               let jpeg = Self.jpeg(image) else { return }
         deliver(jpeg)
     }
@@ -545,12 +570,21 @@ final class DrawnCamera: CameraProducer, @unchecked Sendable {
         return CGImageDestinationFinalize(destination) ? data as Data : nil
     }
 
-    static func draw(_ picture: Picture, width: Int, height: Int, time: TimeInterval) -> CGImage? {
+    /// A `width`×`height` picture; `turned`, as the turned sensor gives it
+    /// (JPEGEncoder.sensorFrame): drawn upright on the portrait
+    /// `height`×`width` and turned a quarter counterclockwise.
+    static func draw(_ picture: Picture, width: Int, height: Int, time: TimeInterval, turned: Bool = false) -> CGImage? {
         guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                                       space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                       bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
         else { return nil }
-        let (w, h) = (CGFloat(width), CGFloat(height))
+        var (w, h) = (CGFloat(width), CGFloat(height))
+        if turned {
+            // A point (x, y) of the upright picture lands at (width - y, x).
+            context.translateBy(x: w, y: 0)
+            context.rotate(by: .pi / 2)
+            (w, h) = (h, w)
+        }
         switch picture {
         case .scene(let camera):
             drawScene(context, w, h, time: time, camera: camera)

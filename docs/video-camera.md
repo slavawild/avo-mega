@@ -11,6 +11,18 @@ This branch adds an MP4/MOV camera source to Avo's existing host-fed virtual cam
 5. If Android was started with both cameras as **Emulated**, restart Android once to switch to the host-fed camera pipeline. If a host-fed camera was already in use, switching sources should take effect without rebooting.
 6. Open an Android camera application. The selected video is decoded on macOS, looped and delivered via Avo's pre-existing JPEG camera feed.
 
+## Orientation, as on a phone
+
+Android's cameras are turned as a phone's are: the HAL reports a sensor orientation of 90° (`<Orientation degree="90"/>` in the external camera HAL's configuration), and every source — a video, the Mac's camera and the emulated scene — sends its upright picture turned a quarter counterclockwise (`JPEGEncoder.sensorFrame`). Apps turn it back as they do on a phone, so in a portrait app:
+
+- a portrait video recorded on a phone fills the camera preview instead of being cropped to a landscape band;
+- a landscape video shows its middle, as a phone held upright in front of a TV would;
+- photos and recordings come out portrait (the HAL writes the turn into their EXIF).
+
+Rotating an Avo window (⌘R) changes the shape of the app's Android display, but Android does not see a turned phone: its displays keep rotation 0 and the accelerometer stays upright. In a landscape window the picture therefore stays upright and is cropped to the window's shape, and photos still come out portrait. Turning the phone itself for Android (display rotation and accelerometer following the window) would need Avo's displays to rotate rather than resize; that is not part of this change.
+
+This applies to the Mac's camera and the emulated scene too, not only to videos, and to every app the next time Android starts (the HAL reads its configuration at boot).
+
 ## Video soundtrack as microphone
 
 After choosing a video, Avo also decodes its audio (if any) to an immutable `.pcm` sidecar in the same folder. In **Settings → Devices → Microphone**, turn on **Use a camera video’s sound** to send this audio into Android's virtual mic instead of asking macOS for live microphone access. Turn it off to keep using the Mac's microphone. The front camera movie is preferred when both front and back have video sources. The switch is unavailable until a camera shows a video. Audio is optional: a file without a usable soundtrack still provides a camera image, but when video-mic mode is selected the guest will record silence, and the note under the switch says so.
@@ -31,6 +43,7 @@ Video FPS follows the Android camera stream request. The movie is decoded in ord
 ## Implementation
 
 - `CameraSource.video(path)` stores the video source in VM configuration; `VMConfig.soundtrackCamera` and `videoMicrophonePCMPath` choose whose soundtrack the microphone hears.
+- `CameraFeed.sensorOrientation` and `JPEGEncoder.sensorFrame` turn every source's picture as a phone's sensor would; `GuestCamera.config` declares the same orientation to the HAL.
 - `FileVideoCamera` decodes the movie sequentially with `AVAssetReader` on a dispatch timer. It sends the frame due at the elapsed time, starts a new reader at the asset duration and encodes/crops into the requested JPEG frame size, turning phone videos upright from the track's preferred transform.
 - `CameraFeed` connects the new producer to the existing virtio-media / Android HAL path.
 - `VideoAudioExtractor` decodes local MP4 audio into a PCM sidecar; `virtio/sound.rs` feeds it into Android capture without Core Audio permissions.
@@ -43,3 +56,4 @@ Video FPS follows the Android camera stream request. The movie is decoded in ord
 - `cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm virtio::sound::` and `control::tests::microphone`
 - `make build` (it applies `scripts/avo-kit-patches` to `vendor/avo_kit` first)
 - In Android, test both camera facings using a Camera2 app, repeat past EOF, switch back to emulated, and verify normal Mac webcam behavior.
+- In a portrait app: a portrait phone video fills the preview upright, a taken photo opens upright in Photos; in a landscape window the preview stays upright. Check a CameraX app and a legacy Camera API app (both honour the sensor orientation).
