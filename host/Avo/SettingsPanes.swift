@@ -5,6 +5,7 @@ import AvoKeymap
 import AvoKit
 import AvoWindowHost
 import SwiftUI
+import UniformTypeIdentifiers
 
 // Control Panel tabs from spec §6. Changes apply immediately; the daemon
 // decides whether they need a VM restart and the restart banner appears.
@@ -600,7 +601,7 @@ struct SystemPane: View {
                 RestartNote(text: "Turning cameras on or off, or giving Android a Mac camera or no camera, applies when Android restarts; switching between cameras after that applies at once.")
             } header: {
                 HelpTitle("Cameras") {
-                    Text("Emulated shows a picture drawn for the camera, with no camera needed. One of this Mac’s cameras shows what it sees while an Android app uses it (its light is on only then). macOS asks for permission the first time.")
+                    Text("Emulated draws a scene. This Mac uses a physical camera only while Android requests frames. Choose video file to loop a local MP4/MOV as the Android camera, without Magisk or LSPosed.")
                     Text("Android apps find the back camera and the front one as on a phone. The Mac’s camera is not mirrored; apps mirror their own preview of the front one.")
                     Text("Off, Android has no camera, and Avo never uses the Mac’s.")
                 }
@@ -1099,6 +1100,8 @@ struct CameraPicker: View {
     /// plugged in or out (a discovery for every re-render held the window up).
     @State private var cameras: [(uniqueID: String, name: String)] = []
     @State private var looked = false
+    @State private var importingVideo = false
+    @State private var videoImportError: String?
 
     var body: some View {
         LabeledContent(title) {
@@ -1111,7 +1114,36 @@ struct CameraPicker: View {
                         HazeOption("Not connected", selection)
                     }
                 }
+                if let path = selection.videoFilePath {
+                    HazeSection("Video file") {
+                        HazeOption(verbatim: URL(fileURLWithPath: path).lastPathComponent, selection)
+                    }
+                }
             }
+        }
+        Button("Choose video file…") { importingVideo = true }
+            .fileImporter(isPresented: $importingVideo, allowedContentTypes: [.mpeg4Movie, .movie]) { result in
+                do {
+                    let url = try result.get()
+                    let accessed = url.startAccessingSecurityScopedResource()
+                    defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                    let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                        .appending(path: "Avo/CameraVideos", directoryHint: .isDirectory)
+                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                    // Copy to a stable path that the separate Avo daemon can read.
+                    // The imported URL may be a temporary security-scoped grant.
+                    let destination = folder.appending(path: UUID().uuidString + "." + url.pathExtension.lowercased())
+                    try FileManager.default.copyItem(at: url, to: destination)
+                    selection = .video(destination.path)
+                    videoImportError = nil
+                } catch {
+                    videoImportError = error.localizedDescription
+                }
+            }
+        if let videoImportError {
+            Text(verbatim: videoImportError)
+                .foregroundStyle(.red)
+                .font(.caption)
         }
         .task { await lookForCameras() }
         .onReceive(NotificationCenter.default.publisher(for: AVCaptureDevice.wasConnectedNotification)) { _ in
