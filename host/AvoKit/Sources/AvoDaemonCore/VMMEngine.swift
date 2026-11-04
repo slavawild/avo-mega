@@ -419,7 +419,13 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
                                         cellular: launch.config.cellularEnabled)
         await agent.sampleProcesses(lock.withLock { processSink })
         // Settings › Devices › Cameras: the Mac's cameras, or scenes, while Android streams them.
-        let cameras = launch.config.cameraFlags.isEmpty ? nil : CameraFeed(socketPath: controlPath, sources: launch.config.cameraSources)
+        let cameras = launch.config.cameraFlags.isEmpty ? nil : CameraFeed(socketPath: controlPath, sources: launch.config.cameraSources) { [weak self] camera in
+            // The movie starts from its beginning: its soundtrack, when it is
+            // the microphone, starts over with it. Not awaited: commands go
+            // one at a time, and the camera feed must not wait on them.
+            guard let self, camera == self.lock.withLock({ self.soundtrackCamera }) else { return }
+            Task { try? await control.send("microphone sync") }
+        }
         let events = try control.events()
         let pump = Task {
             do {
@@ -429,15 +435,7 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
                     if line.hasPrefix("bluetooth hci "), let port = line.split(separator: " ").last.flatMap({ UInt16($0) }) {
                         await agent.useBluetoothPort(port)
                     }
-                    if line.hasPrefix("camera ") {
-                        cameras?.handle(line)
-                        if case .on(let camera, _) = CameraFeed.parse(line),
-                           camera == self.lock.withLock({ self.soundtrackCamera }) {
-                            // Not awaited here: commands go one at a time, and
-                            // this pump must keep taking gpu and frame events.
-                            Task { try? await control.send("microphone sync") }
-                        }
-                    }
+                    if line.hasPrefix("camera ") { cameras?.handle(line) }
                     if line.hasPrefix("disk ") { self.diskFull.handle(line) }
                     bridge.handle(line)
                 }
@@ -845,8 +843,10 @@ extension VMMEngine: WidgetsEngine {
 extension VMMEngine: DeviceSettingsEngine {
     public func applyDeviceSettings(_ config: VMConfig) async {
         let (control, agent, cameras) = lock.withLock { (self.control, self.agent, self.cameras) }
-        cameras?.use(config.cameraSources)
+        // Before the cameras switch: a video chosen while its camera streams
+        // starts over at once, and its soundtrack is found by this.
         lock.withLock { soundtrackCamera = Self.soundtrackCameraIndex(config) }
+        cameras?.use(config.cameraSources)
         try? await control?.send(Self.videoMicrophoneCommand(config))
         try? await control?.send(config.microphoneEnabled ? "microphone on" : "microphone off")
         try? await control?.send(config.networkSpeed.engineCommand)

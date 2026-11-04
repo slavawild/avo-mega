@@ -73,10 +73,16 @@ public final class CameraFeed: @unchecked Sendable {
     /// Frames waiting for `output`: past a few, new ones are dropped.
     private let lock = NSLock()
     private var backlog = 0
+    /// A video source's movie started again from its beginning on this
+    /// camera (Android began streaming it, asked for a new size, or chose
+    /// the video while it streams), so its soundtrack can start over too.
+    /// On `state`.
+    private let videoStarted: (@Sendable (Int) -> Void)?
 
-    public init(socketPath: String, sources: [CameraSource]) {
+    public init(socketPath: String, sources: [CameraSource], videoStarted: (@Sendable (Int) -> Void)? = nil) {
         self.socketPath = socketPath
         self.sources = sources
+        self.videoStarted = videoStarted
     }
 
     /// A line of avo-vmm's event stream (others are ignored).
@@ -141,6 +147,7 @@ public final class CameraFeed: @unchecked Sendable {
         logger.notice("camera \(camera, privacy: .public): \(request.width)×\(request.height) at \(request.fps) fps from \(self.sources[camera].rawValue, privacy: .public)")
         producers[camera] = producer
         producer?.start()
+        if producer is FileVideoCamera { videoStarted?(camera) }
     }
 
     /// On `state`: the Mac's camera `id` (or its default one when that is

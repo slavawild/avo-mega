@@ -212,6 +212,31 @@ import Testing
         }
     }
 
+    /// A video camera says when its movie starts over (its soundtrack then
+    /// starts over too), and only then: the same request again leaves the
+    /// movie playing where it is.
+    @Test func aVideoCameraSaysWhenItsMovieStartsOver() {
+        final class Starts: @unchecked Sendable {
+            let lock = NSLock()
+            var cameras: [Int] = []
+        }
+        let starts = Starts()
+        let path = FileManager.default.temporaryDirectory.appending(path: "avo-cam-\(UUID().uuidString.prefix(8)).sock").path
+        let feed = CameraFeed(socketPath: path, sources: [.none, .video("/nonexistent/a.mp4")]) { camera in
+            starts.lock.withLock { starts.cameras.append(camera) }
+        }
+        feed.handle("camera 1 on 320 240 15")
+        feed.handle("camera 1 on 320 240 15")
+        feed.handle("camera 1 on 640 480 30")
+        feed.handle("camera 0 on 320 240 15")
+        feed.use([.none, .video("/nonexistent/b.mp4")])
+        feed.use([.none, .video("/nonexistent/b.mp4")])
+        feed.handle("camera 1 off")
+        // Runs after everything above on the feed's queue.
+        feed.stop()
+        #expect(starts.lock.withLock { starts.cameras } == [1, 1, 1])
+    }
+
     /// An emulated camera reaches a fake avo-vmm: the feed's handshake, then
     /// frames of the size asked for, until the stream stops.
     @Test func anEmulatedCameraFeedsItsScene() async throws {
