@@ -168,13 +168,6 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
         config.videoMicrophonePCMPath.map { "microphone file " + $0 } ?? "microphone mac"
     }
 
-    static func soundtrackCameraIndex(_ config: VMConfig) -> Int? {
-        guard config.microphoneEnabled, config.microphoneVideoAudio, config.camerasEnabled else { return nil }
-        if config.frontCamera.videoFilePath != nil { return 1 }
-        if config.backCamera.videoFilePath != nil { return 0 }
-        return nil
-    }
-
     /// "Emulate this phone's hardware": the profile's CPU for Android's
     /// cores (`DeviceHardware.CPU.fitted(to:)`), as avo-vmm presents it: each
     /// vCPU's MIDR and a cpufreq policy per cluster. Otherwise the Mac's cores.
@@ -458,7 +451,7 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
             if stops != generation { return (false, nil) }
             self.process = process
             self.cameras = cameras
-            self.soundtrackCamera = Self.soundtrackCameraIndex(launch.config)
+            self.soundtrackCamera = launch.config.soundtrackCamera
             self.vsockPath = vsock
             self.control = control
             self.agent = agent
@@ -845,7 +838,7 @@ extension VMMEngine: DeviceSettingsEngine {
         let (control, agent, cameras) = lock.withLock { (self.control, self.agent, self.cameras) }
         // Before the cameras switch: a video chosen while its camera streams
         // starts over at once, and its soundtrack is found by this.
-        lock.withLock { soundtrackCamera = Self.soundtrackCameraIndex(config) }
+        lock.withLock { soundtrackCamera = config.soundtrackCamera }
         cameras?.use(config.cameraSources)
         try? await control?.send(Self.videoMicrophoneCommand(config))
         try? await control?.send(config.microphoneEnabled ? "microphone on" : "microphone off")

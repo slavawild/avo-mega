@@ -23,6 +23,12 @@ public enum CameraSource: Hashable, Sendable {
         return nil
     }
 
+    /// The 48 kHz stereo S16LE sidecar beside an imported video: its
+    /// soundtrack for Android's microphone.
+    public static func soundtrackPath(ofVideo path: String) -> String {
+        URL(fileURLWithPath: path).deletingPathExtension().appendingPathExtension("pcm").path
+    }
+
     public var macCameraID: String? {
         if case .mac(let id) = self { return id }
         return nil
@@ -65,16 +71,21 @@ extension CameraSource: Codable {
 }
 
 extension VMConfig {
-    /// The front video is preferred because it is commonly used for video calls.
-    /// A sidecar is made when the movie is imported by the Control Panel.
+    /// The camera (as avo-vmm numbers them: 0 back, 1 front) whose video's
+    /// soundtrack Android's microphone hears: with the microphone on and set
+    /// to a video's soundtrack, the front camera's video first (calls use
+    /// it), else the back one's. Nil otherwise: the Mac's microphone, or
+    /// silence with the microphone off.
+    public var soundtrackCamera: Int? {
+        guard microphoneEnabled, microphoneVideoAudio else { return nil }
+        let sources = cameraSources
+        return [1, 0].first { sources[$0].videoFilePath != nil }
+    }
+
+    /// `soundtrackCamera`'s video's soundtrack sidecar (made when the Control
+    /// Panel imports the video; missing when the video has no sound).
     public var videoMicrophonePCMPath: String? {
-        guard microphoneVideoAudio, camerasEnabled else { return nil }
-        for source in [frontCamera, backCamera] {
-            if let path = source.videoFilePath {
-                return URL(fileURLWithPath: path).deletingPathExtension().appendingPathExtension("pcm").path
-            }
-        }
-        return nil
+        soundtrackCamera.flatMap { cameraSources[$0].videoFilePath }.map(CameraSource.soundtrackPath(ofVideo:))
     }
 
     /// The back camera first, as avo-vmm numbers them (0 back, 1 front);

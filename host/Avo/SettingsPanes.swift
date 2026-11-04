@@ -593,15 +593,17 @@ struct SystemPane: View {
             Section {
                 Toggle("Cameras", isOn: Binding(get: { config.camerasEnabled }, set: { value in model.update { $0.camerasEnabled = value } }))
                 if config.camerasEnabled {
-                    CameraPicker(title: "Back camera", selection: Binding(get: { config.backCamera },
-                                                                          set: { value in model.update { $0.backCamera = value } }))
-                    CameraPicker(title: "Front camera", selection: Binding(get: { config.frontCamera },
-                                                                           set: { value in model.update { $0.frontCamera = value } }))
+                    let videos = Set([config.backCamera, config.frontCamera].compactMap(\.videoFilePath))
+                    CameraPicker(title: "Back camera", videosInUse: videos,
+                                 selection: Binding(get: { config.backCamera }, set: { value in model.update { $0.backCamera = value } }))
+                    CameraPicker(title: "Front camera", videosInUse: videos,
+                                 selection: Binding(get: { config.frontCamera }, set: { value in model.update { $0.frontCamera = value } }))
                 }
-                RestartNote(text: "Turning cameras on or off, or giving Android a Mac camera or no camera, applies when Android restarts; switching between cameras after that applies at once.")
+                RestartNote(text: "Turning cameras on or off, or giving Android a Mac camera, a video or no camera, applies when Android restarts; switching between cameras after that applies at once.")
             } header: {
                 HelpTitle("Cameras") {
-                    Text("Emulated draws a scene. This Mac uses a physical camera only while Android requests frames. Choose video file to loop a local MP4/MOV as the Android camera, without Magisk or LSPosed.")
+                    Text("Emulated shows a picture drawn for the camera, with no camera needed. One of this Mac’s cameras shows what it sees while an Android app uses it (its light is on only then). macOS asks for permission the first time.")
+                    Text("A video shows one of your movies, over and over, as if the camera saw it. Avo keeps a copy of it, and of the last few you chose, so it stays in the menu.")
                     Text("Android apps find the back camera and the front one as on a phone. The Mac’s camera is not mirrored; apps mirror their own preview of the front one.")
                     Text("Off, Android has no camera, and Avo never uses the Mac’s.")
                 }
@@ -620,14 +622,14 @@ struct SystemPane: View {
                     }
                 }
                 if config.microphoneEnabled {
-                    Toggle("Use video soundtrack as microphone", isOn: Binding(
+                    let hasVideo = config.cameraSources.contains { $0.videoFilePath != nil }
+                    Toggle("Use a camera video’s sound", isOn: Binding(
                         get: { config.microphoneVideoAudio },
                         set: { value in model.update { $0.microphoneVideoAudio = value } }
                     ))
-                    Text("Uses audio from the selected front camera video (or back camera if no front video). Disable to use this Mac's microphone. Reopen the Android call or recording after switching.")
-                        .font(.mona(12))
-                        .foregroundStyle(Haze.textTertiary)
-                        .hazeRowNote()
+                    // Without a video it does nothing, but one that is on can always go off.
+                    .disabled(!hasVideo && !config.microphoneVideoAudio)
+                    SoundtrackNote(config: config, hasVideo: hasVideo)
                 }
             }
             .shown(sections.contains(.microphone))
@@ -1105,11 +1107,16 @@ struct CopyButton: View {
 /// default camera).
 struct CameraPicker: View {
     let title: LocalizedStringKey
+    /// The videos both cameras show, kept when old copies go.
+    let videosInUse: Set<String>
     @Binding var selection: CameraSource
     /// Looked for once it shows, off the main thread, and again when one is
     /// plugged in or out (a discovery for every re-render held the window up).
     @State private var cameras: [(uniqueID: String, name: String)] = []
     @State private var looked = false
+    /// The movies imported so far (CameraVideos), newest first.
+    @State private var movies: [CameraVideos.Movie] = []
+    @State private var lookedForMovies = false
     @State private var importingVideo = false
     @State private var videoImportError: String?
     @State private var processingVideo = false
@@ -1125,14 +1132,20 @@ struct CameraPicker: View {
                         HazeOption("Not connected", selection)
                     }
                 }
-                if let path = selection.videoFilePath {
-                    HazeSection("Video file") {
-                        HazeOption(verbatim: URL(fileURLWithPath: path).lastPathComponent, selection)
+                HazeSection("Videos") {
+                    for movie in movies { HazeOption(verbatim: movie.name, CameraSource.video(movie.path)) }
+                    if lookedForMovies, let path = selection.videoFilePath, !movies.contains(where: { $0.path == path }) {
+                        HazeOption("Not found", selection)
                     }
                 }
             }
         }
-        .task { await lookForCameras() }
+        .task {
+            await lookForMovies()
+            await lookForCameras()
+        }
+        // A video chosen for either camera, from either picker.
+        .onChange(of: videosInUse) { Task { await lookForMovies() } }
         .onReceive(NotificationCenter.default.publisher(for: AVCaptureDevice.wasConnectedNotification)) { _ in
             Task { await lookForCameras() }
         }
@@ -1155,12 +1168,14 @@ struct CameraPicker: View {
                 processingVideo = true
                 videoImportError = nil
                 Task {
+                    let inUse = videosInUse
                     let outcome = await Task.detached(priority: .userInitiated) {
-                        try await VideoAudioExtractor.importMovie(url)
+                        try await CameraVideos.importMovie(url, inUse: inUse)
                     }.result
                     processingVideo = false
                     switch outcome {
                     case .success(let movie):
+                        await lookForMovies()
                         selection = .video(movie.path)
                         videoImportError = movie.note
                     case .failure(let error):
@@ -1169,14 +1184,22 @@ struct CameraPicker: View {
                 }
             }
         if processingVideo {
-            Text("Importing video and soundtrack…")
-                .font(.caption)
+            Text("Copying the video and its sound…")
+                .font(.mona(12))
+                .foregroundStyle(Haze.textTertiary)
+                .hazeRowNote()
         }
         if let videoImportError {
             Text(verbatim: videoImportError)
-                .foregroundStyle(.red)
-                .font(.caption)
+                .font(.mona(12))
+                .foregroundStyle(Haze.danger)
+                .hazeRowNote()
         }
+    }
+
+    private func lookForMovies() async {
+        movies = await Task.detached(priority: .userInitiated) { CameraVideos.imported() }.value
+        lookedForMovies = true
     }
 
     private func lookForCameras() async {
@@ -1189,6 +1212,32 @@ struct CameraPicker: View {
         AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera, .external, .continuityCamera],
                                          mediaType: .video, position: .unspecified)
             .devices.map { ($0.uniqueID, $0.localizedName) }
+    }
+}
+
+/// Under Settings › Devices › Microphone's video switch: whose sound
+/// Android hears (VMConfig.soundtrackCamera), or why it hears none.
+struct SoundtrackNote: View {
+    let config: VMConfig
+    let hasVideo: Bool
+
+    var body: some View {
+        note
+            .font(.mona(12))
+            .foregroundStyle(Haze.textTertiary)
+            .hazeRowNote()
+    }
+
+    private var note: Text {
+        guard hasVideo else {
+            return Text("Choose a video for the back or front camera first. Until then, Android hears this Mac’s microphone.")
+        }
+        if let pcm = config.videoMicrophonePCMPath, !FileManager.default.fileExists(atPath: pcm),
+           let camera = config.soundtrackCamera, let video = config.cameraSources[camera].videoFilePath {
+            let name = URL(fileURLWithPath: video).lastPathComponent
+            return Text("“\(name)” has no sound Avo can play, so Android records silence. Choose it again, or turn this off for this Mac’s microphone.")
+        }
+        return Text("Android hears the front camera’s video (the back one’s, when the front shows none) instead of this Mac’s microphone, from the start each time that camera starts. Reopen a call or recording after switching.")
     }
 }
 
