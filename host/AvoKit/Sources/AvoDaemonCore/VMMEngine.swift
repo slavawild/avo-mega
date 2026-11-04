@@ -160,6 +160,12 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
                 + cpuFlags(launch) + hardwareFlags(launch)
     }
 
+    /// Audio for the Android mic: an imported video's PCM sidecar, or the Mac.
+    /// Control command takes the full absolute path including spaces.
+    static func videoMicrophoneCommand(_ config: VMConfig) -> String {
+        config.videoMicrophonePCMPath.map { "microphone file " + $0 } ?? "microphone mac"
+    }
+
     /// "Emulate this phone's hardware": the profile's CPU for Android's
     /// cores (`DeviceHardware.CPU.fitted(to:)`), as avo-vmm presents it: each
     /// vCPU's MIDR and a cpufreq policy per cluster. Otherwise the Mac's cores.
@@ -456,6 +462,7 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
             throw CancellationError()
         }
         if let location { try? await control.send(location.command) }
+        try? await control.send(Self.videoMicrophoneCommand(launch.config))
         // Settings › Devices › Network speed: the engine starts at full speed.
         if launch.config.networkSpeed != .full { try? await control.send(launch.config.networkSpeed.engineCommand) }
         // Settings › Devices › Mobile network: the modem starts without a SIM.
@@ -821,6 +828,7 @@ extension VMMEngine: DeviceSettingsEngine {
     public func applyDeviceSettings(_ config: VMConfig) async {
         let (control, agent, cameras) = lock.withLock { (self.control, self.agent, self.cameras) }
         cameras?.use(config.cameraSources)
+        try? await control?.send(Self.videoMicrophoneCommand(config))
         try? await control?.send(config.microphoneEnabled ? "microphone on" : "microphone off")
         try? await control?.send(config.networkSpeed.engineCommand)
         try? await control?.send(config.cellularCommand)
