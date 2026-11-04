@@ -313,8 +313,9 @@ import Testing
         // Zoomed out, black around it, the video in the middle.
         let away = try colors(VideoFraming(mode: .stretch, zoom: 0.5))
         #expect(isBlack(away[0]) && isBlack(away[1]) && isBlack(away[2]), "black around it: \(away)")
-        let middle2 = JPEGEncoder().jpeg(JPEGEncoder.placing(wide, width: 100, height: 100, framing: VideoFraming(mode: .stretch, zoom: 0.5)))
-        #expect(try #require(color(try #require(middle2), x: 0.4, y: 0.5)).red > 150, "the video in the middle")
+        let awayJPEG = try #require(JPEGEncoder().jpeg(JPEGEncoder.placing(wide, width: 100, height: 100, framing: VideoFraming(mode: .stretch, zoom: 0.5))))
+        let inside = try #require(color(awayJPEG, x: 0.4, y: 0.5))
+        #expect(inside.red > 150, "the video in the middle: \(inside)")
     }
 
     /// A movie is decoded no bigger than the turned portrait the camera
