@@ -308,6 +308,19 @@ impl Microphone {
 
     fn file_path(&self) -> Option<String> { self.file.lock().unwrap().clone() }
 
+    /// Restart the active file soundtrack when Android starts its camera.
+    /// The video producer starts on the same event, keeping both near the
+    /// same playback offset even if microphone recording began earlier.
+    pub fn sync_video(&self) {
+        let mut devices = self.devices.lock().unwrap();
+        devices.retain(|device| device.strong_count() > 0);
+        for state in devices.iter().filter_map(Weak::upgrade) {
+            if let Some(soundtrack) = state.lock().unwrap().streams[CAPTURE].video_audio.as_mut() {
+                soundtrack.position = 0.0;
+            }
+        }
+    }
+
     pub fn allowed(&self) -> bool {
         self.allowed.load(Ordering::Acquire)
     }
