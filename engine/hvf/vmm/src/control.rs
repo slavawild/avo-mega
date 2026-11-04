@@ -29,9 +29,10 @@
 //! cellular <gprs|edge|umts|hspa|lte|nr> <bars 0-4>   a SIM registered on that
 //!                                     network with that signal (modem.rs)
 //! cellular off                       no SIM
-//! microphone on|off                  whether Android may use the Mac's
-//!                                     microphone (virtio/sound.rs; off, it
-//!                                     records silence)
+//! microphone on|off                  whether Android may capture audio
+//!                                     (virtio/sound.rs; off, records silence)
+//! microphone mac|file <path>          use the Mac microphone or an imported
+//!                                     48 kHz stereo S16LE PCM soundtrack
 //! tap <x> <y> / swipe <x1> <y1> <x2> <y2> [ms]   pixels of scanout 0 (debugging)
 //! pause                              stop the vCPUs (pause.rs); `ok` once none
 //!                                     runs guest code, an error when one does
@@ -393,11 +394,20 @@ impl Controls {
             Some("gamepad") => self.gamepad(parse_gamepad(&words[1..])?),
             Some("network") => crate::link::LINK.set(crate::link::Conditions::parse(&words[1..])?),
             Some("cellular") => crate::modem::CELLULAR.set(crate::modem::Service::parse(&words[1..])?),
-            Some("microphone") => crate::virtio::sound::MICROPHONE.set(match words.get(1).copied() {
-                Some("on") => true,
-                Some("off") => false,
-                _ => return Err("microphone on|off".into()),
-            }),
+            Some("microphone") => match words.get(1).copied() {
+                Some("on") => crate::virtio::sound::MICROPHONE.set(true),
+                Some("off") => crate::virtio::sound::MICROPHONE.set(false),
+                Some("mac") => crate::virtio::sound::MICROPHONE.set_file(None),
+                Some("file") => {
+                    // Paths may contain spaces; preserve everything after the prefix.
+                    let path = line.strip_prefix("microphone file ").ok_or("microphone file needs a path")?.trim();
+                    if path.is_empty() || path.contains('\n') || !path.ends_with(".pcm") {
+                        return Err("microphone file needs an imported .pcm file".into());
+                    }
+                    crate::virtio::sound::MICROPHONE.set_file(Some(path.to_owned()));
+                }
+                _ => return Err("microphone on|off|mac|file <path>".into()),
+            },
             Some("location") => {
                 if words.get(1) == Some(&"off") {
                     self.gnss.set(None);
