@@ -39,6 +39,8 @@ use super::queue::{Chain, Queue};
 use super::{Active, Interrupt, VirtioDevice};
 use crate::memory::GuestMemory;
 use std::collections::VecDeque;
+use std::os::fd::AsRawFd;
+use std::fs::File;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -181,6 +183,10 @@ struct Stream {
     held: Option<Held>,
     /// Recorded bytes the guest has not taken yet.
     captured: VecDeque<u8>,
+    /// The optional looping video soundtrack; never recorded from Core Audio.
+    video_audio: Option<PCMVideoMic>,
+    /// When the requested file contains no sound, record silence, not the Mac mic.
+    video_mode: bool,
     /// Capture hands over silence until the slack is recorded again.
     priming: bool,
     audio: Option<Audio>,
@@ -229,20 +235,79 @@ struct Tag {
 
 static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 
+/// Immutable imported 48 kHz stereo S16LE audio, mapped on demand.
+/// Memory mapping does not load a long recording into process heap memory.
+struct PCMVideoMic {
+    data: *mut libc::c_void,
+    bytes: usize,
+    position: f64,
+}
+// Only State's mutex owns and accesses this mapping.
+unsafe impl Send for PCMVideoMic {}
+
+impl PCMVideoMic {
+    fn open(path: &str) -> Option<Self> {
+        let file = File::open(path).ok()?;
+        let bytes = usize::try_from(file.metadata().ok()?.len()).ok()?;
+        if bytes < 4 || bytes % 4 != 0 { return None; }
+        let data = unsafe { libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0) };
+        if data == libc::MAP_FAILED { return None; }
+        Some(Self { data, bytes, position: 0.0 })
+    }
+
+    fn sample(bytes: &[u8], frame: usize) -> (i16, i16) {
+        let offset = frame * 4;
+        (i16::from_le_bytes([bytes[offset], bytes[offset + 1]]),
+         i16::from_le_bytes([bytes[offset + 2], bytes[offset + 3]]))
+    }
+
+    fn render(&mut self, params: Params, count: usize) -> Vec<u8> {
+        let frames = self.bytes / 4;
+        let source = unsafe { std::slice::from_raw_parts(self.data.cast::<u8>(), self.bytes) };
+        let output_frames = count / (usize::from(params.channels) * 2).max(1);
+        let mut out = Vec::with_capacity(count);
+        let step = 48_000.0 / f64::from(params.rate);
+        for _ in 0..output_frames {
+            let index = (self.position as usize) % frames;
+            let (left, right) = Self::sample(source, index);
+            if params.channels == 1 {
+                let mono = ((i32::from(left) + i32::from(right)) / 2) as i16;
+                out.extend_from_slice(&mono.to_le_bytes());
+            } else {
+                out.extend_from_slice(&left.to_le_bytes());
+                out.extend_from_slice(&right.to_le_bytes());
+            }
+            self.position = (self.position + step) % frames as f64;
+        }
+        out.resize(count, 0);
+        out
+    }
+}
+
+impl Drop for PCMVideoMic {
+    fn drop(&mut self) { unsafe { libc::munmap(self.data, self.bytes); } }
+}
+
 /// Whether Android may use the Mac's microphone (Settings › Devices ›
 /// Microphone: `microphone on|off` on the control socket, `--no-microphone`
 /// from the start). Off, Android records silence and the microphone is never
 /// opened, so macOS never asks for it; turning it off closes one that is
 /// open. The process's: it lasts through guest reboots.
-pub static MICROPHONE: Microphone = Microphone { allowed: AtomicBool::new(true), devices: Mutex::new(Vec::new()) };
+pub static MICROPHONE: Microphone = Microphone { allowed: AtomicBool::new(true), file: Mutex::new(None), devices: Mutex::new(Vec::new()) };
 
 pub struct Microphone {
     allowed: AtomicBool,
+    /// Imported video's audio path; selected before recording starts.
+    file: Mutex<Option<String>>,
     /// Every machine's sound device, to close its microphone.
     devices: Mutex<Vec<Weak<Mutex<State>>>>,
 }
 
 impl Microphone {
+    pub fn set_file(&self, path: Option<String>) { *self.file.lock().unwrap() = path; }
+
+    fn file_path(&self) -> Option<String> { self.file.lock().unwrap().clone() }
+
     pub fn allowed(&self) -> bool {
         self.allowed.load(Ordering::Acquire)
     }
@@ -449,16 +514,21 @@ impl Sound {
         let id = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
         let tag = Arc::new(Tag { state: Arc::downgrade(&self.state), stream, id });
         if stream == CAPTURE {
-            // Only with the microphone allowed does the daemon ask macOS for it.
-            if let Some(hook) = self.recording.as_ref().filter(|_| MICROPHONE.allowed()) {
-                hook();
+            let file_path = MICROPHONE.file_path();
+            // Do not ask macOS for microphone permission when a file is selected.
+            if file_path.is_none() {
+                if let Some(hook) = self.recording.as_ref().filter(|_| MICROPHONE.allowed()) { hook(); }
             }
-            // Recording runs on a clock from the first moment; the microphone
-            // joins in when it is up. Opening it can wait on macOS's permission
-            // prompt, which must not hold up this vCPU.
             self.install(stream, Audio::new(id, Some(tag.clone())));
+            {
+                let mut state = self.state.lock().unwrap();
+                let entry = &mut state.streams[CAPTURE];
+                entry.video_mode = file_path.is_some();
+                entry.video_audio = file_path.as_deref().and_then(PCMVideoMic::open);
+                entry.priming = !entry.video_mode;
+            }
             spawn_clock(&self.state, stream, id, params);
-            if !muted() && MICROPHONE.allowed() {
+            if file_path.is_none() && !muted() && MICROPHONE.allowed() {
                 open_microphone(self.state.clone(), id, params, tag);
             }
         } else {
@@ -507,6 +577,8 @@ impl Sound {
         let State { active, streams, .. } = &mut *state;
         let entry = &mut streams[stream];
         entry.captured.clear();
+        entry.video_audio = None;
+        entry.video_mode = false;
         let held = entry.held.take();
         let pending: Vec<Chain> = entry.pending.drain(..).collect();
         if let Some(active) = active.as_mut() {
@@ -702,6 +774,15 @@ fn record_period(active: &mut Active, stream: &mut Stream, params: Params) {
     let Some(chain) = stream.pending.pop_front() else { return };
     let room = chain.writable_len().saturating_sub(STATUS_LEN);
     let needed = if stream.priming { room.max(params.capture_slack_bytes()) } else { room };
+    if stream.video_mode {
+        let data = if MICROPHONE.allowed() && !muted() {
+            stream.video_audio.as_mut().map(|audio| audio.render(params, room)).unwrap_or_else(|| vec![0; room])
+        } else {
+            vec![0; room]
+        };
+        hand_back(active, RX, stream, chain, &data);
+        return;
+    }
     let data: Vec<u8> = if stream.captured.len() >= needed {
         stream.priming = false;
         stream.stats.played += 1;
@@ -1254,6 +1335,13 @@ extern "C" fn recorded(user: *mut c_void, queue: AudioQueueRef, buffer: *mut Aud
 mod tests {
     use super::*;
     use hvf::GuestRegion;
+
+    #[test]
+    fn pcm_video_sample_decodes_signed_stereo() {
+        let samples = [0x00, 0x80, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(PCMVideoMic::sample(&samples, 0), (i16::MIN, i16::MAX));
+        assert_eq!(PCMVideoMic::sample(&samples, 1), (0, 0));
+    }
 
     #[test]
     fn describes_one_playback_and_one_capture_stream() {
