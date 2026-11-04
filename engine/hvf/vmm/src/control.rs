@@ -169,6 +169,42 @@ fn parse_gamepad(words: &[&str]) -> Result<GamepadReport, String> {
 const SUBSCRIBER_BACKLOG: usize = 1024;
 
 /// The scanout of a `frame <index> <sequence>` line.
+/// A `microphone …` command.
+#[derive(Debug, PartialEq)]
+enum Microphone {
+    /// `on|off`: whether Android may record at all.
+    Allowed(bool),
+    /// `mac`: the Mac's microphone.
+    Mac,
+    /// `file <path>`: an imported video's soundtrack sidecar (48 kHz stereo
+    /// S16LE), by its absolute path, spaces and all.
+    File(String),
+    /// `sync`: the video camera started its movie over; so does its soundtrack.
+    Sync,
+}
+
+fn parse_microphone(line: &str) -> Result<Microphone, String> {
+    let usage = || "microphone on|off|mac|sync|file <path>".to_string();
+    let rest = line.trim().strip_prefix("microphone").ok_or_else(usage)?.trim_start();
+    let (word, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    match word {
+        "on" | "off" | "mac" | "sync" if !after.trim().is_empty() => Err(usage()),
+        "on" => Ok(Microphone::Allowed(true)),
+        "off" => Ok(Microphone::Allowed(false)),
+        "mac" => Ok(Microphone::Mac),
+        "sync" => Ok(Microphone::Sync),
+        "file" => {
+            // The rest of the line is the path: a file's name may hold spaces.
+            let path = after.trim();
+            if !path.starts_with('/') || !path.ends_with(".pcm") || path.len() <= "/.pcm".len() {
+                return Err("microphone file needs an imported soundtrack's absolute .pcm path".into());
+            }
+            Ok(Microphone::File(path.to_owned()))
+        }
+        _ => Err(usage()),
+    }
+}
+
 fn frame_scanout(line: &str) -> Option<&str> {
     line.strip_prefix("frame ")?.split(' ').next()
 }
@@ -395,21 +431,15 @@ impl Controls {
             Some("gamepad") => self.gamepad(parse_gamepad(&words[1..])?),
             Some("network") => crate::link::LINK.set(crate::link::Conditions::parse(&words[1..])?),
             Some("cellular") => crate::modem::CELLULAR.set(crate::modem::Service::parse(&words[1..])?),
-            Some("microphone") => match words.get(1).copied() {
-                Some("on") => crate::virtio::sound::MICROPHONE.set(true),
-                Some("off") => crate::virtio::sound::MICROPHONE.set(false),
-                Some("mac") => crate::virtio::sound::MICROPHONE.set_file(None),
-                Some("sync") => crate::virtio::sound::MICROPHONE.sync_video(),
-                Some("file") => {
-                    // Paths may contain spaces; preserve everything after the prefix.
-                    let path = line.strip_prefix("microphone file ").ok_or("microphone file needs a path")?.trim();
-                    if path.is_empty() || path.contains('\n') || !path.ends_with(".pcm") {
-                        return Err("microphone file needs an imported .pcm file".into());
-                    }
-                    crate::virtio::sound::MICROPHONE.set_file(Some(path.to_owned()));
+            Some("microphone") => {
+                use crate::virtio::sound::MICROPHONE;
+                match parse_microphone(line)? {
+                    Microphone::Allowed(allowed) => MICROPHONE.set(allowed),
+                    Microphone::Mac => MICROPHONE.set_file(None),
+                    Microphone::Sync => MICROPHONE.sync_video(),
+                    Microphone::File(path) => MICROPHONE.set_file(Some(path)),
                 }
-                _ => return Err("microphone on|off|mac|sync|file <path>".into()),
-            },
+            }
             Some("location") => {
                 if words.get(1) == Some(&"off") {
                     self.gnss.set(None);
@@ -542,6 +572,22 @@ pub fn serve(path: &Path, controls: Arc<Controls>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microphone_commands_are_read_whole() {
+        assert_eq!(parse_microphone("microphone on"), Ok(Microphone::Allowed(true)));
+        assert_eq!(parse_microphone("microphone off"), Ok(Microphone::Allowed(false)));
+        assert_eq!(parse_microphone("microphone mac"), Ok(Microphone::Mac));
+        assert_eq!(parse_microphone("microphone sync"), Ok(Microphone::Sync));
+        // A path keeps its spaces, wherever the command's own spaces fall.
+        let path = "/Users/a b/Library/Application Support/Avo/CameraVideos/1/My  clip.pcm";
+        assert_eq!(parse_microphone(&format!("microphone file {path}")), Ok(Microphone::File(path.into())));
+        assert_eq!(parse_microphone(&format!("  microphone   file   {path}  ")), Ok(Microphone::File(path.into())));
+        for line in ["microphone", "microphone file", "microphone file clip.pcm", "microphone file /a/clip.mp4", "microphone file /.pcm",
+                     "microphone on now", "microphone loud", "microphones on"] {
+            assert!(parse_microphone(line).is_err(), "{line}");
+        }
+    }
 
     fn summary(events: &[Event]) -> Vec<(u16, i32)> {
         events.iter().map(|e| (e.code, e.value)).collect()

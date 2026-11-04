@@ -54,9 +54,10 @@ jobs:
         run: |
           # GitHub-hosted macOS runs inside a VM. Two machine::pause_tests
           # invoke hv_vm_create() and fail with HV_UNSUPPORTED there.
-          # Compile the entire test binary, then run sound/audio tests only.
+          # Compile the entire test binary, then run the sound and microphone tests only.
           cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm --no-run
           cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm virtio::sound::
+          cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm control::tests::microphone
 
       - name: Test camera models and camera feed
         run: |
