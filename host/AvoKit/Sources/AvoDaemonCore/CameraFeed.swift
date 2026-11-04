@@ -325,60 +325,161 @@ final class MacCamera: NSObject, CameraProducer, AVCaptureVideoDataOutputSampleB
 }
 
 /// Loop a local video into the existing JPEG camera-feed protocol.
-/// Frames are requested at the camera's clock; the generator finds the video
-/// frame at that playback timestamp. The asset is never played with audio.
+///
+/// The movie is decoded in order by an AVAssetReader, as a player does,
+/// rather than looked up frame by frame: a lookup decodes from the last key
+/// frame every time, too slow for HD at Android's rate. On each tick of the
+/// camera's clock the frame due at that moment of the movie is sent (the
+/// last one again when the movie has no newer frame yet); at the movie's end
+/// (`asset.duration`, where its soundtrack sidecar ends too) the reader
+/// starts over from the beginning. A slow tick decodes the frames it missed
+/// without sending them, so the picture never falls behind real time.
+/// The asset is never played with audio.
 final class FileVideoCamera: CameraProducer, @unchecked Sendable {
+    /// What the reader needs, loaded once with AVFoundation's async API.
+    private struct Movie {
+        let track: AVAssetTrack
+        /// Seconds; the loop's length.
+        let duration: Double
+        let orientation: CGImagePropertyOrientation
+    }
+
+    private let asset: AVURLAsset
     private let request: CameraFeed.Request
     private let deliver: @Sendable (Data) -> Void
-    private let generator: AVAssetImageGenerator
-    private let duration: Double
     private let encoder = JPEGEncoder()
-    private let timer: DispatchSourceTimer
     private let clock = ContinuousClock()
-    private var started: ContinuousClock.Instant?
+    /// Everything below changes on `queue` only.
+    private let queue = DispatchQueue(label: "com.avodroid.cameras.video")
+    private var stopped = false
+    private var movie: Movie?
+    private var timer: DispatchSourceTimer?
+    private var reader: AVAssetReader?
+    private var output: AVAssetReaderTrackOutput?
+    /// When the current loop's 0 s was.
+    private var loopStart: ContinuousClock.Instant?
+    /// A decoded frame that is not due yet.
+    private var next: CMSampleBuffer?
+    /// The frame sent last, sent again until a newer one is due.
+    private var last: Data?
 
     init(path: String, request: CameraFeed.Request, deliver: @escaping @Sendable (Data) -> Void) {
+        self.asset = AVURLAsset(url: URL(fileURLWithPath: path))
         self.request = request
         self.deliver = deliver
-        let asset = AVURLAsset(url: URL(fileURLWithPath: path))
-        generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        generator.requestedTimeToleranceBefore = CMTime(value: 1, timescale: 40)
-        generator.requestedTimeToleranceAfter = CMTime(value: 1, timescale: 40)
-        // These properties are synchronous for compatibility with the existing
-        // CameraProducer interface. Only local, user-selected files are used.
-        duration = asset.duration.seconds
-        timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "com.avodroid.cameras.video"))
-        timer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / max(request.fps, 1)), leeway: .milliseconds(3))
-        timer.setEventHandler { [weak self] in self?.tick() }
     }
 
     func start() {
-        started = clock.now
-        timer.resume()
+        let asset = self.asset
+        Task { [weak self] in
+            // Missing, corrupt or unsupported video: nothing is sent, and the
+            // VM keeps its own gray fallback.
+            guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+                  let duration = try? await asset.load(.duration), duration.isNumeric, duration.seconds > 0,
+                  let transform = try? await track.load(.preferredTransform)
+            else { return }
+            let movie = Movie(track: track, duration: duration.seconds, orientation: Self.orientation(transform))
+            guard let self else { return }
+            queue.async { self.begin(movie) }
+        }
     }
 
     func stop() {
-        timer.cancel()
-        generator.cancelAllCGImageGeneration()
+        queue.sync {
+            stopped = true
+            timer?.cancel()
+            timer = nil
+            reader?.cancelReading()
+            reader = nil
+            output = nil
+            next = nil
+        }
     }
 
+    /// On `queue`: the movie is loaded; it plays from its beginning now.
+    private func begin(_ movie: Movie) {
+        guard !stopped else { return }
+        self.movie = movie
+        loopStart = clock.now
+        rewind()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / max(request.fps, 1)), leeway: .milliseconds(3))
+        timer.setEventHandler { [weak self] in self?.tick() }
+        self.timer = timer
+        timer.resume()
+    }
+
+    /// On `queue`: a new reader at the movie's beginning.
+    private func rewind() {
+        reader?.cancelReading()
+        reader = nil
+        output = nil
+        next = nil
+        guard let movie, let reader = try? AVAssetReader(asset: asset) else { return }
+        let output = AVAssetReaderTrackOutput(track: movie.track, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        ])
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { return }
+        reader.add(output)
+        guard reader.startReading() else { return }
+        self.reader = reader
+        self.output = output
+    }
+
+    /// On `queue`, once per frame Android wants.
     private func tick() {
-        guard let started, duration.isFinite, duration > 0 else { return }
-        // Follow elapsed time rather than counting callbacks: a slow decode
-        // drops old frames instead of gradually drifting behind real time.
-        let elapsed = started.duration(to: clock.now)
-        let seconds = Double(elapsed.components.seconds)
-            + Double(elapsed.components.attoseconds) / 1e18
-        let timestamp = seconds.truncatingRemainder(dividingBy: duration)
-        let time = CMTime(seconds: max(0, timestamp), preferredTimescale: 600)
-        do {
-            let cgImage = try generator.copyCGImage(at: time, actualTime: nil)
-            let resized = JPEGEncoder.filling(CIImage(cgImage: cgImage), width: request.width, height: request.height)
-            if let jpeg = encoder.jpeg(resized) { deliver(jpeg) }
-        } catch {
-            // Missing, corrupt or unsupported video: the VM keeps its own
-            // gray fallback, and the next frame is attempted on the next tick.
+        guard !stopped, let movie, var loopStart else { return }
+        let elapsed = loopStart.duration(to: clock.now)
+        var seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+        if seconds >= movie.duration {
+            // The movie's end: the next loop starts where this one ended
+            // (more than one when the clock jumped, as after a sleep).
+            let loops = (seconds / movie.duration).rounded(.down)
+            loopStart = loopStart.advanced(by: .seconds(loops * movie.duration))
+            self.loopStart = loopStart
+            seconds -= loops * movie.duration
+            rewind()
+        }
+        if let frame = latestFrame(upTo: seconds), let jpeg = encode(frame, movie.orientation) {
+            last = jpeg
+        }
+        if let last { deliver(last) }
+    }
+
+    /// On `queue`: decodes up to `seconds` into the movie and returns the
+    /// latest frame due by then, nil when none newer than the last is due.
+    private func latestFrame(upTo seconds: Double) -> CVPixelBuffer? {
+        var due: CVPixelBuffer?
+        while true {
+            if next == nil {
+                // At the end of the movie: the last frame stays up until the loop starts over.
+                guard let sample = output?.copyNextSampleBuffer() else { break }
+                next = sample
+            }
+            guard let sample = next else { break }
+            let time = CMSampleBufferGetPresentationTimeStamp(sample)
+            if time.isNumeric, time.seconds > seconds { break }
+            next = nil
+            if let pixels = CMSampleBufferGetImageBuffer(sample) { due = pixels }
+        }
+        return due
+    }
+
+    private func encode(_ pixels: CVPixelBuffer, _ orientation: CGImagePropertyOrientation) -> Data? {
+        let image = CIImage(cvPixelBuffer: pixels).oriented(orientation)
+        return encoder.jpeg(JPEGEncoder.filling(image, width: request.width, height: request.height))
+    }
+
+    /// A track's preferred transform (how a player turns its picture
+    /// upright) as an image orientation: phones record portrait movies
+    /// sideways and say so here.
+    static func orientation(_ transform: CGAffineTransform) -> CGImagePropertyOrientation {
+        switch (transform.a, transform.b, transform.c, transform.d) {
+        case (0, 1, -1, 0): .right
+        case (0, -1, 1, 0): .left
+        case (-1, 0, 0, -1): .down
+        default: .up
         }
     }
 }
