@@ -329,7 +329,6 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
     private let timer: DispatchSourceTimer
     private let clock = ContinuousClock()
     private var started: ContinuousClock.Instant?
-    private var frameNumber: Int64 = 0
 
     init(path: String, request: CameraFeed.Request, deliver: @escaping @Sendable (Data) -> Void) {
         self.request = request
@@ -337,8 +336,8 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
         let asset = AVURLAsset(url: URL(fileURLWithPath: path))
         generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        generator.requestedTimeToleranceBefore = .milliseconds(25)
-        generator.requestedTimeToleranceAfter = .milliseconds(25)
+        generator.requestedTimeToleranceBefore = CMTime(value: 1, timescale: 40)
+        generator.requestedTimeToleranceAfter = CMTime(value: 1, timescale: 40)
         // These properties are synchronous for compatibility with the existing
         // CameraProducer interface. Only local, user-selected files are used.
         duration = asset.duration.seconds
