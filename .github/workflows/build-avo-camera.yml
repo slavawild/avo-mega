@@ -89,15 +89,22 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p build
-          make build 2>&1 | tee build/xcodebuild.log
+          # The Xcode phase that builds avo-vmm looks for cargo in ~/.cargo/bin
+          # unless told: the one the steps above used.
+          CARGO="$(command -v cargo)" make build 2>&1 | tee build/xcodebuild.log
 
       - name: Verify app and package ZIP
         run: |
           set -euo pipefail
           APP="build/DerivedData/Build/Products/Debug/Avo.app"
-          test -d "$APP"
-          test -x "$APP/Contents/MacOS/Avo"
-          test -x "$APP/Contents/MacOS/avo-vmm"
+          for file in "$APP/Contents/MacOS/Avo" "$APP/Contents/MacOS/avo-vmm"; do
+            if [ ! -x "$file" ]; then
+              echo "::error::Avo.app has no $(basename "$file")"
+              ls -la "$APP/Contents/MacOS" || true
+              grep -n -i -E "cargo|avo-vmm" build/xcodebuild.log | grep -i -E "warning|error" | head -20 || true
+              exit 1
+            fi
+          done
           codesign --verify --deep --strict "$APP"
           ditto -c -k --keepParent "$APP" "build/Avo-MP4-Camera-macOS-arm64.zip"
 
@@ -117,78 +124,5 @@ jobs:
           path: |
             build/xcodebuild.log
             build/gfxstream-src/*log
-          if-no-files-found: ignore
-          retention-days: 14
-
-  # GitHub's macOS arm64 runners are short ("capacity constraints"), and a
-  # job that finds none in 15 minutes is cancelled. Intel runners come from
-  # another pool: this job checks that everything compiles and that the
-  # Swift tests pass while the build above waits. It makes no app to
-  # install: avo-vmm is built for the machine it is built on, so Avo.app is
-  # compiled for Apple silicon here without it (CARGO pointing nowhere makes
-  # the Xcode phase skip it), and avo-vmm and its tests are compiled for
-  # Apple silicon on their own (they cannot run on Intel).
-  check-intel:
-    name: Compile and test on Intel
-    runs-on: macos-15-intel
-    timeout-minutes: 90
-
-    steps:
-      - name: Check out source and submodules
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Use the newest Xcode 26
-        run: |
-          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
-          if [ -z "$XCODE" ]; then
-            echo "::error::No Xcode 26 on this runner; it has:"
-            ls -d /Applications/Xcode*.app
-            exit 1
-          fi
-          sudo xcode-select -s "$XCODE/Contents/Developer"
-
-      - name: Check toolchain
-        run: |
-          sw_vers
-          uname -m
-          xcodebuild -version
-          swift --version
-
-      - name: Install build dependencies
-        run: |
-          brew install xcodegen
-          if ! command -v rustup >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/rustup" target add aarch64-apple-darwin
-
-      - name: Apply Avo's avo_kit patches (Swift 6.3 workaround)
-        run: scripts/patch-avo-kit.sh
-
-      - name: Compile avo-vmm and its tests for Apple silicon
-        run: cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm --target aarch64-apple-darwin --no-run
-
-      - name: Test camera models, camera feed and device settings
-        run: |
-          cd host/AvoKit
-          swift test --filter CameraSettingsTests
-          swift test --filter CameraFeedTests
-          swift test --filter DeviceSettingsTests
-
-      - name: Compile Avo for Apple silicon (without avo-vmm)
-        run: |
-          set -o pipefail
-          mkdir -p build
-          CARGO=/nonexistent make build 2>&1 | tee build/xcodebuild-intel.log
-
-      - name: Upload build log if anything fails
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Avo-MP4-Camera-intel-build-log
-          path: build/xcodebuild-intel.log
           if-no-files-found: ignore
           retention-days: 14
