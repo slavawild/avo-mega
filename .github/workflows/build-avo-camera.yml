@@ -1,0 +1,87 @@
+name: Build Avo MP4 Camera (macOS)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'host/**'
+      - 'engine/**'
+      - 'scripts/**'
+      - '.github/workflows/build-avo-camera.yml'
+      - 'Makefile'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build for Apple Silicon
+    runs-on: macos-26
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check toolchain
+        run: |
+          uname -m
+          xcodebuild -version
+          swift --version
+
+      - name: Install build dependencies
+        run: |
+          brew install xcodegen cmake ninja
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build the optional GPU renderer
+        id: gfx
+        continue-on-error: true
+        run: make gfxstream
+
+      - name: Test camera models and camera feed
+        run: |
+          cd host/AvoKit
+          swift test --filter CameraSettingsTests
+          swift test --filter CameraFeedTests
+
+      - name: Build Avo for Apple Silicon
+        run: |
+          set -o pipefail
+          mkdir -p build
+          make build 2>&1 | tee build/xcodebuild.log
+
+      - name: Verify app and package ZIP
+        run: |
+          set -euo pipefail
+          APP="build/DerivedData/Build/Products/Debug/Avo.app"
+          test -d "$APP"
+          test -x "$APP/Contents/MacOS/Avo"
+          test -x "$APP/Contents/MacOS/avo-vmm"
+          codesign --verify --deep --strict "$APP"
+          ditto -c -k --keepParent "$APP" "build/Avo-MP4-Camera-macOS-arm64.zip"
+
+      - name: Upload installable Avo (unsigned test build)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Avo-MP4-Camera-macOS-arm64
+          path: build/Avo-MP4-Camera-macOS-arm64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log if anything fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Avo-MP4-Camera-build-log
+          path: |
+            build/xcodebuild.log
+            build/gfxstream-src/*log
+          if-no-files-found: ignore
+          retention-days: 14
