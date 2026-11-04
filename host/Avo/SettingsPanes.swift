@@ -1224,15 +1224,15 @@ struct CameraPicker: View {
     }
 }
 
-/// How a camera's video fills Android's picture (VideoFraming): all of it,
-/// with a slider for which part shows, or the whole video on black. Android
-/// shows a change at its next frame; the slider writes when it is let go.
+/// How a camera's video fills Android's picture (VideoFraming): filling it
+/// (cropped), whole on black, or stretched to it; turned, zoomed, and
+/// where it is cropped, which part shows. Android shows a change at its
+/// next frame; the sliders write when they are let go.
 struct VideoFramingControls: View {
     @Binding var framing: VideoFraming
-    @State private var draft: Double?
 
     var body: some View {
-        HazeSegmented(options: [(VideoFraming.Mode.fill, Text("Fill the picture")), (.fit, Text("Whole video"))],
+        HazeSegmented(options: [(VideoFraming.Mode.fill, Text("Fill the picture")), (.fit, Text("Whole video")), (.stretch, Text("Stretch"))],
                       selection: Binding(get: { framing.mode }, set: { framing.mode = $0 }))
             .accessibilityLabel(Text("Video framing"))
         HStack(spacing: 10) {
@@ -1241,32 +1241,88 @@ struct VideoFramingControls: View {
                           selection: Binding(get: { framing.quarterTurns }, set: { framing.rotation = $0 }))
                 .accessibilityLabel(Text("Turn the video clockwise"))
         }
-        if framing.mode == .fill {
-            HStack(spacing: 10) {
-                Image(systemName: "arrow.left").foregroundStyle(Haze.textTertiary)
-                HazeSlider(value: Binding(get: { draft ?? framing.clampedPosition }, set: { value in
-                    if draft == nil { framing.position = value } else { draft = value }
-                }), range: -1...1, step: 0.05) { editing in
-                    if editing {
-                        draft = framing.clampedPosition
-                    } else if let draft {
-                        self.draft = nil
-                        if draft != framing.position { framing.position = draft }
-                    }
-                }
-                .accessibilityLabel(Text("Which part of the video shows"))
-                Image(systemName: "arrow.right").foregroundStyle(Haze.textTertiary)
-            }
-            Text("Which part of the video Android sees where it does not fit: its left or top edge, its middle, or its right or bottom edge. Apps show the front camera mirrored.")
-                .font(.mona(12))
-                .foregroundStyle(Haze.textTertiary)
-                .hazeRowNote()
-        } else {
-            Text("All of the video, with black where it does not reach the picture’s edges.")
-                .font(.mona(12))
-                .foregroundStyle(Haze.textTertiary)
-                .hazeRowNote()
+        FramingSlider(value: Binding(get: { framing.clampedZoom }, set: { framing.zoom = $0 }),
+                      range: VideoFraming.zoomRange, step: 0.05, leading: "minus.magnifyingglass", trailing: "plus.magnifyingglass") {
+            Text($0, format: .percent.precision(.fractionLength(0)))
         }
+        .accessibilityLabel(Text("Zoom"))
+        if framing.crops {
+            FramingSlider(value: Binding(get: { framing.clampedPosition }, set: { framing.position = $0 }),
+                          range: -1...1, step: 0.05, leading: "arrow.left", trailing: "arrow.right")
+                .accessibilityLabel(Text("Which part of the video shows"))
+        }
+        note
+            .font(.mona(12))
+            .foregroundStyle(Haze.textTertiary)
+            .hazeRowNote()
+    }
+
+    private var note: Text {
+        switch framing.mode {
+        case .fill:
+            Text("The picture full, the video cropped to it; the arrows pick the part that shows. Apps show the front camera mirrored.")
+        case .fit:
+            Text("All of the video, with black where it does not reach the picture’s edges.")
+        case .stretch:
+            Text("All of the video stretched to the picture’s shape, without black or cropping; its proportions change to fit.")
+        }
+    }
+}
+
+/// A slider between two symbols that writes its value when it is let go,
+/// with the value beside it when `label` gives one.
+struct FramingSlider<Label: View>: View {
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+    let leading: String
+    let trailing: String
+    var label: ((Double) -> Label)?
+    @State private var draft: Double?
+
+    init(value: Binding<Double>, range: ClosedRange<Double>, step: Double, leading: String, trailing: String,
+         label: @escaping (Double) -> Label) {
+        _value = value
+        self.range = range
+        self.step = step
+        self.leading = leading
+        self.trailing = trailing
+        self.label = label
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: leading).foregroundStyle(Haze.textTertiary)
+            HazeSlider(value: Binding(get: { draft ?? value }, set: { newValue in
+                if draft == nil { value = newValue } else { draft = newValue }
+            }), range: range, step: step) { editing in
+                if editing {
+                    draft = value
+                } else if let draft {
+                    self.draft = nil
+                    if draft != value { value = draft }
+                }
+            }
+            Image(systemName: trailing).foregroundStyle(Haze.textTertiary)
+            if let label {
+                label(draft ?? value)
+                    .font(.mona(12))
+                    .foregroundStyle(Haze.textTertiary)
+                    .monospacedDigit()
+                    .frame(minWidth: 40, alignment: .trailing)
+            }
+        }
+    }
+}
+
+extension FramingSlider where Label == EmptyView {
+    init(value: Binding<Double>, range: ClosedRange<Double>, step: Double, leading: String, trailing: String) {
+        _value = value
+        self.range = range
+        self.step = step
+        self.leading = leading
+        self.trailing = trailing
+        self.label = nil
     }
 }
 

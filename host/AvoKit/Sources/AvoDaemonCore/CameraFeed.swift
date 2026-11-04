@@ -305,35 +305,33 @@ final class JPEGEncoder: @unchecked Sendable {
             .cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
     }
 
-    /// `image` in `width`×`height` as `framing` says: covering it and
-    /// cropped where its position says, or whole, centered on black.
+    /// `image` in `width`×`height` as `framing` says: covering it, whole on
+    /// black, or stretched to it; times its zoom. Where it overflows, its
+    /// position picks the part along the side that overflows most (the
+    /// other is centered); where it falls short, it is centered on black.
     static func placing(_ image: CIImage, width: Int, height: Int, framing: VideoFraming) -> CIImage {
         let extent = image.extent
         let frame = CGRect(x: 0, y: 0, width: width, height: height)
+        let (wide, high) = (CGFloat(width) / extent.width, CGFloat(height) / extent.height)
+        let zoom = CGFloat(framing.clampedZoom)
+        let (sx, sy): (CGFloat, CGFloat)
         switch framing.mode {
-        case .fill:
-            let scale = max(CGFloat(width) / extent.width, CGFloat(height) / extent.height)
-            // What is left over on the cropped side, spread by the position:
-            // -1 keeps the left (top) edge, 1 the right (bottom) one.
-            let along = CGFloat(framing.clampedPosition)
-            let x = (extent.width * scale - CGFloat(width)) * (1 + along) / 2
-            let y = (extent.height * scale - CGFloat(height)) * (1 - along) / 2
-            return image
-                .transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY)
-                    .concatenating(CGAffineTransform(scaleX: scale, y: scale))
-                    .concatenating(CGAffineTransform(translationX: -x, y: -y)))
-                .cropped(to: frame)
-        case .fit:
-            let scale = min(CGFloat(width) / extent.width, CGFloat(height) / extent.height)
-            let x = (CGFloat(width) - extent.width * scale) / 2
-            let y = (CGFloat(height) - extent.height * scale) / 2
-            return image
-                .transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY)
-                    .concatenating(CGAffineTransform(scaleX: scale, y: scale))
-                    .concatenating(CGAffineTransform(translationX: x, y: y)))
-                .composited(over: CIImage(color: .black).cropped(to: frame))
-                .cropped(to: frame)
+        case .fill: (sx, sy) = (max(wide, high) * zoom, max(wide, high) * zoom)
+        case .fit: (sx, sy) = (min(wide, high) * zoom, min(wide, high) * zoom)
+        case .stretch: (sx, sy) = (wide * zoom, high * zoom)
         }
+        let overX = extent.width * sx - CGFloat(width), overY = extent.height * sy - CGFloat(height)
+        // -1 keeps the left (top) edge, 1 the right (bottom) one.
+        let along = CGFloat(framing.clampedPosition)
+        let alongX = overX >= overY
+        let x = overX > 0 ? overX * (alongX ? (1 + along) / 2 : 0.5) : overX / 2
+        let y = overY > 0 ? overY * (alongX ? 0.5 : (1 - along) / 2) : overY / 2
+        return image
+            .transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY)
+                .concatenating(CGAffineTransform(scaleX: sx, y: sy))
+                .concatenating(CGAffineTransform(translationX: -x, y: -y)))
+            .composited(over: CIImage(color: .black).cropped(to: frame))
+            .cropped(to: frame)
     }
 
     /// `image` turned `quarterTurns` quarters clockwise (its extent moves;
@@ -457,6 +455,9 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
     /// Decode at the size the camera needs (`decodeSize`); off when this
     /// movie's decoder refused to scale, so it decodes as recorded.
     private var scaledDecoding = true
+    /// The zoom the reader decodes enough for; nil when it decodes the movie
+    /// at its own size (any zoom is covered).
+    private var decodedZoom: Double?
     /// What the log says every five seconds (category "cameras"): frames
     /// sent and newly encoded, and the time decoding and encoding took.
     private var stats = (sent: 0, encoded: 0, decode: Duration.zero, encode: Duration.zero)
@@ -530,15 +531,21 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
         timer.resume()
     }
 
-    /// On `queue`: a new reader at the movie's beginning.
-    private func rewind() {
+    /// On `queue`: a new reader at the movie's beginning, or at `start`
+    /// seconds into it (zoomed in further than the reader decodes for).
+    private func rewind(at start: Double = 0) {
         reader?.cancelReading()
         reader = nil
         output = nil
         next = nil
         guard let movie, let reader = try? AVAssetReader(asset: asset) else { return }
+        if start > 0 {
+            reader.timeRange = CMTimeRange(start: CMTime(seconds: start, preferredTimescale: 600), duration: .positiveInfinity)
+        }
         var settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-        let size = scaledDecoding ? Self.decodeSize(natural: movie.naturalSize, orientation: movie.orientation, request: request) : nil
+        let zoom = framing().clampedZoom
+        let size = scaledDecoding ? Self.decodeSize(natural: movie.naturalSize, orientation: movie.orientation, request: request, zoom: zoom) : nil
+        decodedZoom = size == nil ? nil : max(1, zoom)
         if let size {
             // The decoder scales (in hardware where it can): a 4K movie is
             // not decoded at 4K for a 720p camera.
@@ -565,17 +572,19 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
 
     /// The size to decode a movie at: as small as the portrait the phone
     /// shows (Android's frame turned, JPEGEncoder.sensorFrame) allows while
-    /// still covering it whichever way the movie is turned, in its own
-    /// (unturned) orientation, even sides; nil when the movie is no bigger
-    /// than that.
-    static func decodeSize(natural: CGSize, orientation: CGImagePropertyOrientation, request: CameraFeed.Request) -> CGSize? {
+    /// still covering it whichever way the movie is turned, and `zoom`
+    /// times more when zoomed in, in its own (unturned) orientation, even
+    /// sides; nil when the movie is no bigger than that.
+    static func decodeSize(natural: CGSize, orientation: CGImagePropertyOrientation, request: CameraFeed.Request,
+                           zoom: Double = 1) -> CGSize? {
         guard natural.width > 0, natural.height > 0 else { return nil }
         // The framing can turn the video a quarter at any time without a
         // new reader (VideoFraming.rotation): cover the portrait either way.
         let covering = { (picture: CGSize) in
             max(CGFloat(request.height) / picture.width, CGFloat(request.width) / picture.height)
         }
-        let scale = max(covering(natural), covering(CGSize(width: natural.height, height: natural.width)))
+        // Zoomed in, the part shown is that much smaller: decode that much more.
+        let scale = max(covering(natural), covering(CGSize(width: natural.height, height: natural.width))) * max(1, CGFloat(zoom))
         guard scale < 1 else { return nil }
         // Nearest even side (rounding up could turn 1280.0000001 into 1282).
         func even(_ side: CGFloat) -> CGFloat { max(16, (side / 2).rounded() * 2) }
@@ -595,6 +604,11 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
             self.loopStart = loopStart
             seconds -= loops * movie.duration
             rewind()
+        }
+        // Zoomed in past what the reader decodes for: decode more from here on.
+        if let decodedZoom, self.framing().clampedZoom > decodedZoom + 0.01 {
+            rewind(at: seconds)
+            lastFraming = nil
         }
         let decodeStart = clock.now
         if let frame = latestFrame(upTo: seconds) {

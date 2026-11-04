@@ -25,11 +25,13 @@ This applies to the Mac's camera and the emulated scene too, not only to videos,
 
 ## Framing a video
 
-Below a camera that shows a video, **Fill the picture** and **Whole video** choose how the video meets Android's picture, for that video only (`VMConfig.cameraVideoFraming`, by its path):
+Below a camera that shows a video, **Fill the picture**, **Whole video** and **Stretch** choose how the video meets Android's picture, for that video only (`VMConfig.cameraVideoFraming`, by its path):
 
 - **Fill the picture** (the default) covers the picture and crops the video; the slider picks which part shows — its left (or top) edge, its middle, or its right (or bottom) edge. A landscape video in a portrait app shows only a slice of its width, so this is where to aim it.
 - **Whole video** shows all of it, with black where it does not reach the picture's edges.
-- **0° / 90° / 180° / 270°** turns the video clockwise first, for one recorded on its side (or one you want on its side). It applies to either framing.
+- **Stretch** shows all of the video stretched to the picture's shape, with no black and no cropping; its proportions change to fit.
+- **0° / 90° / 180° / 270°** turns the video clockwise first, for one recorded on its side (or one you want on its side). It applies to every framing.
+- The **zoom** slider (50–300%) scales the video from the size its framing gives: above 100% it comes closer and is cropped (the position slider then picks the part, along the side cropped most), below 100% it goes away with black around it. Zooming into a large movie decodes it bigger from that moment, so the picture stays sharp.
 
 A change shows in Android at the next frame, without restarting the video; the slider writes when it is let go. Apps mirror the front camera's preview, so there the slider's left shows on the right.
 

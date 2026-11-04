@@ -19,12 +19,16 @@ import Testing
         #expect(config.effect(of: old) == .immediate)
         let decoded = try JSONDecoder().decode(VMConfig.self, from: JSONEncoder().encode(config))
         #expect(decoded.cameraVideoFraming == config.cameraVideoFraming)
-        // Framing from before rotation: unturned.
+        // Framing from before rotation and zoom: unturned, unzoomed.
         let older = Data(#"{"cameraVideoFraming": {"/a.mov": {"mode": "fit", "position": 0.5}}}"#.utf8)
         #expect(try JSONDecoder().decode(VMConfig.self, from: older).cameraVideoFraming["/a.mov"] == VideoFraming(mode: .fit, position: 0.5))
         let unknown = Data(#"{"cameraVideoFraming": {"/a.mov": {"mode": "zoom", "position": 0}}}"#.utf8)
         #expect(try JSONDecoder().decode(VMConfig.self, from: unknown).cameraVideoFraming == [:])
         #expect(VideoFraming(position: 7).clampedPosition == 1 && VideoFraming(position: -.infinity).clampedPosition == 0)
+        #expect(VideoFraming(zoom: 10).clampedZoom == 3 && VideoFraming(zoom: 0.1).clampedZoom == 0.5 && VideoFraming(zoom: .nan).clampedZoom == 1)
+        // A part to choose only where some of the video is cropped.
+        #expect(VideoFraming(mode: .fill).crops && !VideoFraming(mode: .fit).crops && !VideoFraming(mode: .stretch).crops)
+        #expect(VideoFraming(mode: .stretch, zoom: 1.5).crops)
     }
 
     /// Whose sound Android's microphone hears: the front camera's video,
@@ -298,6 +302,19 @@ import Testing
         #expect(isRed(middle[0]) && isBlue(middle[1]), "its middle: \(middle)")
         let whole = try colors(VideoFraming(mode: .fit))
         #expect(isRed(whole[0]) && isBlue(whole[1]) && isBlack(whole[2]), "all of it, black above: \(whole)")
+        // Stretched: all of it, top to bottom, no black.
+        let stretched = try colors(VideoFraming(mode: .stretch))
+        #expect(isRed(stretched[0]) && isBlue(stretched[1]) && !isBlack(stretched[2]), "stretched: \(stretched)")
+        // Zoomed in twice, the position picks within the left or right half.
+        let closeLeft = try colors(VideoFraming(mode: .fill, position: -1, zoom: 2))
+        #expect(isRed(closeLeft[0]) && isRed(closeLeft[1]), "zoomed on its left: \(closeLeft)")
+        let closeRight = try colors(VideoFraming(mode: .fill, position: 1, zoom: 2))
+        #expect(isBlue(closeRight[0]) && isBlue(closeRight[1]), "zoomed on its right: \(closeRight)")
+        // Zoomed out, black around it, the video in the middle.
+        let away = try colors(VideoFraming(mode: .stretch, zoom: 0.5))
+        #expect(isBlack(away[0]) && isBlack(away[1]) && isBlack(away[2]), "black around it: \(away)")
+        let middle2 = JPEGEncoder().jpeg(JPEGEncoder.placing(wide, width: 100, height: 100, framing: VideoFraming(mode: .stretch, zoom: 0.5)))
+        #expect(try #require(color(try #require(middle2), x: 0.4, y: 0.5)).red > 150, "the video in the middle")
     }
 
     /// A movie is decoded no bigger than the turned portrait the camera
@@ -314,6 +331,13 @@ import Testing
         #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 2160, height: 3840), orientation: .up, request: hd)
                 == CGSize(width: 1280, height: 2276))
         #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 640, height: 360), orientation: .up, request: hd) == nil)
+        // Zoomed in one and a half times, 4K decodes that much bigger; twice, as it is.
+        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 3840, height: 2160), orientation: .up, request: hd, zoom: 1.5)
+                == CGSize(width: 3414, height: 1920))
+        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 3840, height: 2160), orientation: .up, request: hd, zoom: 2) == nil)
+        // Zoomed out, no smaller than unzoomed.
+        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 3840, height: 2160), orientation: .up, request: hd, zoom: 0.5)
+                == CGSize(width: 2276, height: 1280))
     }
 
     /// Turned a quarter clockwise, a picture's left edge is on top.

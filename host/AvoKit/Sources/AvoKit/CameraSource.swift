@@ -36,8 +36,9 @@ public enum CameraSource: Hashable, Sendable {
 }
 
 /// How a camera's video fills the picture (Settings › Devices › Cameras):
-/// all of it, cropped where `position` says, or the whole video with black
-/// around it, turned `rotation` quarters clockwise first. Kept per video
+/// all of it, cropped where `position` says; the whole video with black
+/// around it; or stretched to it. Turned `rotation` quarters clockwise
+/// first, and `zoom` times the size its mode gives. Kept per video
 /// (`VMConfig.cameraVideoFraming`).
 public struct VideoFraming: Codable, Hashable, Sendable {
     public enum Mode: String, Codable, Hashable, Sendable {
@@ -45,7 +46,14 @@ public struct VideoFraming: Codable, Hashable, Sendable {
         case fill
         /// The whole video, with black where it does not reach.
         case fit
+        /// The whole video stretched to the picture's shape (its own
+        /// proportions are not kept).
+        case stretch
     }
+
+    /// How far `zoom` goes (0.5 shows the video at half the size its mode
+    /// gives, 3 at three times).
+    public static let zoomRange: ClosedRange<Double> = 0.5...3
 
     public var mode: Mode
     /// Filling, which part of the video shows along the side it is cropped
@@ -54,22 +62,36 @@ public struct VideoFraming: Codable, Hashable, Sendable {
     /// Quarter turns clockwise of the upright video (0 to 3), for one that
     /// was recorded on its side or should be.
     public var rotation: Int
+    /// Times the size `mode` gives: above 1 the video comes closer (and is
+    /// cropped, `position` choosing the part), below 1 it goes away (black
+    /// around it).
+    public var zoom: Double
 
-    public init(mode: Mode = .fill, position: Double = 0, rotation: Int = 0) {
+    public init(mode: Mode = .fill, position: Double = 0, rotation: Int = 0, zoom: Double = 1) {
         self.mode = mode
         self.position = position
         self.rotation = rotation
+        self.zoom = zoom
     }
 
-    private enum CodingKeys: String, CodingKey { case mode, position, rotation }
+    private enum CodingKeys: String, CodingKey { case mode, position, rotation, zoom }
 
-    /// Framing saved before rotation existed has none.
+    /// Framing saved before rotation and zoom existed has neither.
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         mode = try container.decode(Mode.self, forKey: .mode)
         position = try container.decode(Double.self, forKey: .position)
         rotation = try container.decodeIfPresent(Int.self, forKey: .rotation) ?? 0
+        zoom = try container.decodeIfPresent(Double.self, forKey: .zoom) ?? 1
     }
+
+    /// `zoom` within `zoomRange`.
+    public var clampedZoom: Double {
+        min(max(zoom.isFinite ? zoom : 1, Self.zoomRange.lowerBound), Self.zoomRange.upperBound)
+    }
+
+    /// Whether some of the video is cropped, so `position` has a part to choose.
+    public var crops: Bool { mode == .fill || clampedZoom > 1 }
 
     /// `rotation` as 0, 1, 2 or 3 quarter turns clockwise.
     public var quarterTurns: Int { ((rotation % 4) + 4) % 4 }
