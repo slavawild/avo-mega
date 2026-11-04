@@ -65,6 +65,18 @@ extension CameraSource: Codable {
 }
 
 extension VMConfig {
+    /// The front video is preferred because it is commonly used for video calls.
+    /// A sidecar is made when the movie is imported by the Control Panel.
+    public var videoMicrophonePCMPath: String? {
+        guard microphoneVideoAudio, camerasEnabled else { return nil }
+        for source in [frontCamera, backCamera] {
+            if let path = source.videoFilePath {
+                return URL(fileURLWithPath: path).deletingPathExtension().appendingPathExtension("pcm").path
+            }
+        }
+        return nil
+    }
+
     /// The back camera first, as avo-vmm numbers them (0 back, 1 front);
     /// none while cameras are off.
     public var cameraSources: [CameraSource] { camerasEnabled ? [backCamera, frontCamera] : [.none, .none] }
