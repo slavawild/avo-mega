@@ -9,6 +9,21 @@ import Testing
 @testable import AvoDaemonCore
 
 @Suite struct CameraSettingsTests {
+    /// Each video's framing is kept by its path, applies at once, and a
+    /// framing this Avo does not know leaves videos filling, centered.
+    @Test func videoFramingIsKeptPerVideo() throws {
+        var config = VMConfig()
+        let old = config
+        config.cameraVideoFraming["/Videos/1/clip.mov"] = VideoFraming(mode: .fit)
+        config.cameraVideoFraming["/Videos/2/wide.mp4"] = VideoFraming(mode: .fill, position: -0.5)
+        #expect(config.effect(of: old) == .immediate)
+        let decoded = try JSONDecoder().decode(VMConfig.self, from: JSONEncoder().encode(config))
+        #expect(decoded.cameraVideoFraming == config.cameraVideoFraming)
+        let unknown = Data(#"{"cameraVideoFraming": {"/a.mov": {"mode": "zoom", "position": 0}}}"#.utf8)
+        #expect(try JSONDecoder().decode(VMConfig.self, from: unknown).cameraVideoFraming == [:])
+        #expect(VideoFraming(position: 7).clampedPosition == 1 && VideoFraming(position: -.infinity).clampedPosition == 0)
+    }
+
     /// Whose sound Android's microphone hears: the front camera's video,
     /// else the back one's, only with the microphone on and set to it.
     @Test func theMicrophoneHearsTheFrontVideoFirst() {
@@ -255,6 +270,31 @@ import Testing
         // The drawn scene and notices turn the same way, at the same size.
         let turned = try #require(DrawnCamera.draw(.notice(.missing), width: 640, height: 480, time: 0, turned: true))
         #expect((turned.width, turned.height) == (640, 480))
+    }
+
+    /// A wide picture, red on the left and blue on the right, in a square:
+    /// filling shows the part its position says, whole it sits on black.
+    @Test func videosFillOrFitAsTheirFramingSays() throws {
+        let red = CIImage(color: .red).cropped(to: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let blue = CIImage(color: .blue).cropped(to: CGRect(x: 100, y: 0, width: 100, height: 100))
+        let wide = red.composited(over: blue)
+        func colors(_ framing: VideoFraming) throws -> [(red: Int, green: Int, blue: Int)] {
+            let placed = JPEGEncoder.placing(wide, width: 100, height: 100, framing: framing)
+            #expect(placed.extent == CGRect(x: 0, y: 0, width: 100, height: 100))
+            let jpeg = try #require(JPEGEncoder().jpeg(placed))
+            return try [(0.1, 0.5), (0.9, 0.5), (0.5, 0.05)].map { try #require(color(jpeg, x: $0.0, y: $0.1)) }
+        }
+        let isRed = { (c: (red: Int, green: Int, blue: Int)) in c.red > 150 && c.blue < 100 }
+        let isBlue = { (c: (red: Int, green: Int, blue: Int)) in c.blue > 150 && c.red < 100 }
+        let isBlack = { (c: (red: Int, green: Int, blue: Int)) in c.red < 40 && c.green < 40 && c.blue < 40 }
+        let left = try colors(VideoFraming(mode: .fill, position: -1))
+        #expect(isRed(left[0]) && isRed(left[1]), "its left edge: \(left)")
+        let right = try colors(VideoFraming(mode: .fill, position: 1))
+        #expect(isBlue(right[0]) && isBlue(right[1]), "its right edge: \(right)")
+        let middle = try colors(VideoFraming())
+        #expect(isRed(middle[0]) && isBlue(middle[1]), "its middle: \(middle)")
+        let whole = try colors(VideoFraming(mode: .fit))
+        #expect(isRed(whole[0]) && isBlue(whole[1]) && isBlack(whole[2]), "all of it, black above: \(whole)")
     }
 
     /// Phones record portrait movies sideways and say how to turn them.

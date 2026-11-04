@@ -90,11 +90,26 @@ public final class CameraFeed: @unchecked Sendable {
     /// the video while it streams), so its soundtrack can start over too.
     /// On `state`.
     private let videoStarted: (@Sendable (Int) -> Void)?
+    /// How each video fills the picture (VMConfig.cameraVideoFraming): read
+    /// by a playing video at every frame, so a change shows at once.
+    private let framingLock = NSLock()
+    private var framing: [String: VideoFraming]
 
-    public init(socketPath: String, sources: [CameraSource], videoStarted: (@Sendable (Int) -> Void)? = nil) {
+    public init(socketPath: String, sources: [CameraSource], framing: [String: VideoFraming] = [:],
+                videoStarted: (@Sendable (Int) -> Void)? = nil) {
         self.socketPath = socketPath
         self.sources = sources
+        self.framing = framing
         self.videoStarted = videoStarted
+    }
+
+    /// How each video fills the picture now; a playing one follows at its next frame.
+    public func useFraming(_ framing: [String: VideoFraming]) {
+        framingLock.withLock { self.framing = framing }
+    }
+
+    func framing(of path: String) -> VideoFraming {
+        framingLock.withLock { framing[path] } ?? VideoFraming()
     }
 
     /// A line of avo-vmm's event stream (others are ignored).
@@ -154,7 +169,9 @@ public final class CameraFeed: @unchecked Sendable {
         case .mac(let id):
             producer = macCamera(id, camera: camera, request: request, deliver: deliver)
         case .video(let path):
-            producer = FileVideoCamera(path: path, request: request, deliver: deliver)
+            producer = FileVideoCamera(path: path, request: request, deliver: deliver) { [weak self] in
+                self?.framing(of: path) ?? VideoFraming()
+            }
         }
         logger.notice("camera \(camera, privacy: .public): \(request.width)×\(request.height) at \(request.fps) fps from \(self.sources[camera].rawValue, privacy: .public)")
         producers[camera] = producer
@@ -276,10 +293,41 @@ final class JPEGEncoder: @unchecked Sendable {
     /// turned a quarter counterclockwise into the `width`×`height` frame
     /// Android asked for. Turned back a quarter clockwise, as apps do, it is
     /// upright again.
-    static func sensorFrame(_ upright: CIImage, width: Int, height: Int) -> CIImage {
-        filling(upright, width: height, height: width)
+    static func sensorFrame(_ upright: CIImage, width: Int, height: Int, framing: VideoFraming = VideoFraming()) -> CIImage {
+        placing(upright, width: height, height: width, framing: framing)
             .transformed(by: CGAffineTransform(translationX: CGFloat(width), y: 0).rotated(by: .pi / 2))
             .cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
+    }
+
+    /// `image` in `width`×`height` as `framing` says: covering it and
+    /// cropped where its position says, or whole, centered on black.
+    static func placing(_ image: CIImage, width: Int, height: Int, framing: VideoFraming) -> CIImage {
+        let extent = image.extent
+        let frame = CGRect(x: 0, y: 0, width: width, height: height)
+        switch framing.mode {
+        case .fill:
+            let scale = max(CGFloat(width) / extent.width, CGFloat(height) / extent.height)
+            // What is left over on the cropped side, spread by the position:
+            // -1 keeps the left (top) edge, 1 the right (bottom) one.
+            let along = CGFloat(framing.clampedPosition)
+            let x = (extent.width * scale - CGFloat(width)) * (1 + along) / 2
+            let y = (extent.height * scale - CGFloat(height)) * (1 - along) / 2
+            return image
+                .transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY)
+                    .concatenating(CGAffineTransform(scaleX: scale, y: scale))
+                    .concatenating(CGAffineTransform(translationX: -x, y: -y)))
+                .cropped(to: frame)
+        case .fit:
+            let scale = min(CGFloat(width) / extent.width, CGFloat(height) / extent.height)
+            let x = (CGFloat(width) - extent.width * scale) / 2
+            let y = (CGFloat(height) - extent.height * scale) / 2
+            return image
+                .transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY)
+                    .concatenating(CGAffineTransform(scaleX: scale, y: scale))
+                    .concatenating(CGAffineTransform(translationX: x, y: y)))
+                .composited(over: CIImage(color: .black).cropped(to: frame))
+                .cropped(to: frame)
+        }
     }
 
     /// `image` scaled to cover `width`×`height` and cropped to it, centered.
@@ -387,11 +435,19 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
     private var next: CMSampleBuffer?
     /// The frame sent last, sent again until a newer one is due.
     private var last: Data?
+    /// The picture `last` came from, and how it was framed: encoded again
+    /// when the framing changes, even while the movie shows no new frame.
+    private var lastPixels: CVPixelBuffer?
+    private var lastFraming: VideoFraming?
+    /// How the movie fills the picture now (CameraFeed.useFraming).
+    private let framing: @Sendable () -> VideoFraming
 
-    init(path: String, request: CameraFeed.Request, deliver: @escaping @Sendable (Data) -> Void) {
+    init(path: String, request: CameraFeed.Request, deliver: @escaping @Sendable (Data) -> Void,
+         framing: @escaping @Sendable () -> VideoFraming = { VideoFraming() }) {
         self.asset = AVURLAsset(url: URL(fileURLWithPath: path))
         self.request = request
         self.deliver = deliver
+        self.framing = framing
     }
 
     func start() {
@@ -418,6 +474,7 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
             reader = nil
             output = nil
             next = nil
+            lastPixels = nil
         }
     }
 
@@ -466,8 +523,16 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
             seconds -= loops * movie.duration
             rewind()
         }
-        if let frame = latestFrame(upTo: seconds), let jpeg = encode(frame, movie.orientation) {
+        let framing = self.framing()
+        if let frame = latestFrame(upTo: seconds) {
+            lastPixels = frame
+        } else if framing == lastFraming {
+            if let last { deliver(last) }
+            return
+        }
+        if let pixels = lastPixels, let jpeg = encode(pixels, movie.orientation, framing) {
             last = jpeg
+            lastFraming = framing
         }
         if let last { deliver(last) }
     }
@@ -493,9 +558,9 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
         return due
     }
 
-    private func encode(_ pixels: CVPixelBuffer, _ orientation: CGImagePropertyOrientation) -> Data? {
+    private func encode(_ pixels: CVPixelBuffer, _ orientation: CGImagePropertyOrientation, _ framing: VideoFraming) -> Data? {
         let image = CIImage(cvPixelBuffer: pixels).oriented(orientation)
-        return encoder.jpeg(JPEGEncoder.sensorFrame(image, width: request.width, height: request.height))
+        return encoder.jpeg(JPEGEncoder.sensorFrame(image, width: request.width, height: request.height, framing: framing))
     }
 
     /// A track's preferred transform (how a player turns its picture

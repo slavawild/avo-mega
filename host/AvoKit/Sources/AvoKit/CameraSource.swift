@@ -35,6 +35,31 @@ public enum CameraSource: Hashable, Sendable {
     }
 }
 
+/// How a camera's video fills the picture (Settings › Devices › Cameras):
+/// all of it, cropped where `position` says, or the whole video with black
+/// around it. Kept per video (`VMConfig.cameraVideoFraming`).
+public struct VideoFraming: Codable, Hashable, Sendable {
+    public enum Mode: String, Codable, Hashable, Sendable {
+        /// The picture full, the video cropped to it.
+        case fill
+        /// The whole video, with black where it does not reach.
+        case fit
+    }
+
+    public var mode: Mode
+    /// Filling, which part of the video shows along the side it is cropped
+    /// on: -1 its left (or top) edge, 0 its middle, 1 its right (or bottom).
+    public var position: Double
+
+    public init(mode: Mode = .fill, position: Double = 0) {
+        self.mode = mode
+        self.position = position
+    }
+
+    /// `position` within -1…1.
+    public var clampedPosition: Double { min(max(position.isFinite ? position : 0, -1), 1) }
+}
+
 extension CameraSource: Codable {
     /// `emulated`, `none`, `mac:<unique ID>`, or `video:<absolute path>`.
     public var rawValue: String {

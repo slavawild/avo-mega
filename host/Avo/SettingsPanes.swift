@@ -594,9 +594,10 @@ struct SystemPane: View {
                 Toggle("Cameras", isOn: Binding(get: { config.camerasEnabled }, set: { value in model.update { $0.camerasEnabled = value } }))
                 if config.camerasEnabled {
                     let videos = Set([config.backCamera, config.frontCamera].compactMap(\.videoFilePath))
-                    CameraPicker(title: "Back camera", videosInUse: videos,
+                    let framing = Binding(get: { config.cameraVideoFraming }, set: { value in model.update { $0.cameraVideoFraming = value } })
+                    CameraPicker(title: "Back camera", videosInUse: videos, framing: framing,
                                  selection: Binding(get: { config.backCamera }, set: { value in model.update { $0.backCamera = value } }))
-                    CameraPicker(title: "Front camera", videosInUse: videos,
+                    CameraPicker(title: "Front camera", videosInUse: videos, framing: framing,
                                  selection: Binding(get: { config.frontCamera }, set: { value in model.update { $0.frontCamera = value } }))
                 }
                 RestartNote(text: "Turning cameras on or off, or giving Android a Mac camera, a video or no camera, applies when Android restarts; switching between cameras after that applies at once.")
@@ -1109,6 +1110,8 @@ struct CameraPicker: View {
     let title: LocalizedStringKey
     /// The videos both cameras show, kept when old copies go.
     let videosInUse: Set<String>
+    /// How each video fills the picture (VMConfig.cameraVideoFraming).
+    @Binding var framing: [String: VideoFraming]
     @Binding var selection: CameraSource
     /// Looked for once it shows, off the main thread, and again when one is
     /// plugged in or out (a discovery for every re-render held the window up).
@@ -1178,11 +1181,17 @@ struct CameraPicker: View {
                         await lookForMovies()
                         selection = .video(movie.path)
                         videoImportError = movie.note
+                        // Framing of videos the import let go of goes with them.
+                        let kept = framing.filter { FileManager.default.fileExists(atPath: $0.key) }
+                        if kept.count != framing.count { framing = kept }
                     case .failure(let error):
                         videoImportError = error.localizedDescription
                     }
                 }
             }
+        if let path = selection.videoFilePath {
+            VideoFramingControls(framing: Binding(get: { framing[path] ?? VideoFraming() }, set: { framing[path] = $0 }))
+        }
         if processingVideo {
             Text("Copying the video and its sound…")
                 .font(.mona(12))
@@ -1212,6 +1221,46 @@ struct CameraPicker: View {
         AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera, .external, .continuityCamera],
                                          mediaType: .video, position: .unspecified)
             .devices.map { ($0.uniqueID, $0.localizedName) }
+    }
+}
+
+/// How a camera's video fills Android's picture (VideoFraming): all of it,
+/// with a slider for which part shows, or the whole video on black. Android
+/// shows a change at its next frame; the slider writes when it is let go.
+struct VideoFramingControls: View {
+    @Binding var framing: VideoFraming
+    @State private var draft: Double?
+
+    var body: some View {
+        HazeSegmented(options: [(VideoFraming.Mode.fill, Text("Fill the picture")), (.fit, Text("Whole video"))],
+                      selection: Binding(get: { framing.mode }, set: { framing.mode = $0 }))
+            .accessibilityLabel(Text("Video framing"))
+        if framing.mode == .fill {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.left").foregroundStyle(Haze.textTertiary)
+                HazeSlider(value: Binding(get: { draft ?? framing.clampedPosition }, set: { value in
+                    if draft == nil { framing.position = value } else { draft = value }
+                }), range: -1...1, step: 0.05) { editing in
+                    if editing {
+                        draft = framing.clampedPosition
+                    } else if let draft {
+                        self.draft = nil
+                        if draft != framing.position { framing.position = draft }
+                    }
+                }
+                .accessibilityLabel(Text("Which part of the video shows"))
+                Image(systemName: "arrow.right").foregroundStyle(Haze.textTertiary)
+            }
+            Text("Which part of the video Android sees where it does not fit: its left or top edge, its middle, or its right or bottom edge. Apps show the front camera mirrored.")
+                .font(.mona(12))
+                .foregroundStyle(Haze.textTertiary)
+                .hazeRowNote()
+        } else {
+            Text("All of the video, with black where it does not reach the picture’s edges.")
+                .font(.mona(12))
+                .foregroundStyle(Haze.textTertiary)
+                .hazeRowNote()
+        }
     }
 }
 

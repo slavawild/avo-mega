@@ -412,7 +412,8 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
                                         cellular: launch.config.cellularEnabled)
         await agent.sampleProcesses(lock.withLock { processSink })
         // Settings › Devices › Cameras: the Mac's cameras, or scenes, while Android streams them.
-        let cameras = launch.config.cameraFlags.isEmpty ? nil : CameraFeed(socketPath: controlPath, sources: launch.config.cameraSources) { [weak self] camera in
+        let cameras = launch.config.cameraFlags.isEmpty ? nil : CameraFeed(socketPath: controlPath, sources: launch.config.cameraSources,
+                                                                               framing: launch.config.cameraVideoFraming) { [weak self] camera in
             // The movie starts from its beginning: its soundtrack, when it is
             // the microphone, starts over with it. Not awaited: commands go
             // one at a time, and the camera feed must not wait on them.
@@ -839,6 +840,7 @@ extension VMMEngine: DeviceSettingsEngine {
         // Before the cameras switch: a video chosen while its camera streams
         // starts over at once, and its soundtrack is found by this.
         lock.withLock { soundtrackCamera = config.soundtrackCamera }
+        cameras?.useFraming(config.cameraVideoFraming)
         cameras?.use(config.cameraSources)
         try? await control?.send(Self.videoMicrophoneCommand(config))
         try? await control?.send(config.microphoneEnabled ? "microphone on" : "microphone off")

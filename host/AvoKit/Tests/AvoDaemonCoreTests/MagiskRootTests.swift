@@ -447,6 +447,10 @@ final class RecordingClipboard: ClipboardBridge, @unchecked Sendable {
         _ = try await core.updateConfiguration(new, client: panel)
         #expect(engine.applied.count == before + 1)
         #expect(engine.applied.last?.microphoneVideoAudio == true)
+        // How a video fills the picture, at once too.
+        new.cameraVideoFraming["/Videos/1/clip.mov"] = VideoFraming(mode: .fit)
+        _ = try await core.updateConfiguration(new, client: panel)
+        #expect(engine.applied.last?.cameraVideoFraming["/Videos/1/clip.mov"]?.mode == .fit)
     }
 
     /// Clipboard off: the Mac's clipboard is no longer watched, and nothing

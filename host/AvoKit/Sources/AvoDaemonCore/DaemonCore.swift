@@ -1022,7 +1022,8 @@ public actor DaemonCore {
         if new.translationAtStartup, !old.translationAtStartup { deps.screenText?.wake() }
         if new.wifiEnabled != old.wifiEnabled || new.networkSpeed != old.networkSpeed || new.shareMacBluetooth != old.shareMacBluetooth
             || new.cellularCommand != old.cellularCommand || new.cameraSources != old.cameraSources
-            || new.microphoneEnabled != old.microphoneEnabled || new.microphoneVideoAudio != old.microphoneVideoAudio,
+            || new.microphoneEnabled != old.microphoneEnabled || new.microphoneVideoAudio != old.microphoneVideoAudio
+            || new.cameraVideoFraming != old.cameraVideoFraming,
            let engine = deps.engine as? any DeviceSettingsEngine {
             await engine.applyDeviceSettings(new)
         }

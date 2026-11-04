@@ -23,6 +23,15 @@ Rotating an Avo window (⌘R) changes the shape of the app's Android display, bu
 
 This applies to the Mac's camera and the emulated scene too, not only to videos, and to every app the next time Android starts (the HAL reads its configuration at boot).
 
+## Framing a video
+
+Below a camera that shows a video, **Fill the picture** and **Whole video** choose how the video meets Android's picture, for that video only (`VMConfig.cameraVideoFraming`, by its path):
+
+- **Fill the picture** (the default) covers the picture and crops the video; the slider picks which part shows — its left (or top) edge, its middle, or its right (or bottom) edge. A landscape video in a portrait app shows only a slice of its width, so this is where to aim it.
+- **Whole video** shows all of it, with black where it does not reach the picture's edges.
+
+A change shows in Android at the next frame, without restarting the video; the slider writes when it is let go. Apps mirror the front camera's preview, so there the slider's left shows on the right.
+
 ## Video soundtrack as microphone
 
 After choosing a video, Avo also decodes its audio (if any) to an immutable `.pcm` sidecar in the same folder. In **Settings → Devices → Microphone**, turn on **Use a camera video’s sound** to send this audio into Android's virtual mic instead of asking macOS for live microphone access. Turn it off to keep using the Mac's microphone. The front camera movie is preferred when both front and back have video sources. The switch is unavailable until a camera shows a video. Audio is optional: a file without a usable soundtrack still provides a camera image, but when video-mic mode is selected the guest will record silence, and the note under the switch says so.
@@ -43,6 +52,7 @@ Video FPS follows the Android camera stream request. The movie is decoded in ord
 ## Implementation
 
 - `CameraSource.video(path)` stores the video source in VM configuration; `VMConfig.soundtrackCamera` and `videoMicrophonePCMPath` choose whose soundtrack the microphone hears.
+- `VideoFraming` (fill with a position, or fit) is read by a playing `FileVideoCamera` at every frame through `CameraFeed.useFraming`; `JPEGEncoder.placing` draws it.
 - `CameraFeed.sensorOrientation` and `JPEGEncoder.sensorFrame` turn every source's picture as a phone's sensor would; `GuestCamera.config` declares the same orientation to the HAL.
 - `FileVideoCamera` decodes the movie sequentially with `AVAssetReader` on a dispatch timer. It sends the frame due at the elapsed time, starts a new reader at the asset duration and encodes/crops into the requested JPEG frame size, turning phone videos upright from the track's preferred transform.
 - `CameraFeed` connects the new producer to the existing virtio-media / Android HAL path.
