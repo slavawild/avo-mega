@@ -77,6 +77,10 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
     private var cameras: CameraFeed?
     /// The camera whose imported video also supplies microphone audio.
     private var soundtrackCamera: Int?
+    /// The cameras Android streams now, and while any does, what reads
+    /// cameraserver's frame counts into the log (CameraServiceStats).
+    private var streamingCameras: Set<Int> = []
+    private var cameraServiceWatch: Task<Void, Never>?
     /// The running start, and whether it booted Magisk's init_boot (RootEngine).
     private var launched: EngineLaunch?
     private var bootedWithMagisk = false
@@ -167,6 +171,48 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
         arguments += cpuFlags(launch)
         arguments += hardwareFlags(launch)
         return arguments
+    }
+
+    /// Android stopped: no streams to read.
+    private func stopCameraServiceWatch() {
+        lock.withLock {
+            cameraServiceWatch?.cancel()
+            cameraServiceWatch = nil
+            streamingCameras = []
+        }
+    }
+
+    /// While Android streams a camera the Mac feeds, every five seconds the
+    /// frames cameraserver says the camera HAL gave each of the app's
+    /// streams (its preview, its recording) go to the log, category
+    /// "cameras", beside what the Mac sent and Android took: how far frames
+    /// get on their way to the app.
+    private func watchCameraService(_ line: String, agent: HostAgent) {
+        guard let event = CameraFeed.parse(line) else { return }
+        lock.withLock {
+            switch event {
+            case .on(let camera, _): streamingCameras.insert(camera)
+            case .off(let camera): streamingCameras.remove(camera)
+            }
+            if streamingCameras.isEmpty {
+                cameraServiceWatch?.cancel()
+                cameraServiceWatch = nil
+            } else if cameraServiceWatch == nil {
+                cameraServiceWatch = Task {
+                    let log = Logger(subsystem: AvoIdentifiers.logSubsystem, category: "cameras")
+                    var previous: CameraServiceStats?
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .seconds(5))
+                        guard !Task.isCancelled, let dump = try? await agent.cameraServiceDump() else { continue }
+                        let stats = CameraServiceStats(dump: dump, at: .now)
+                        if let previous, let report = stats.report(since: previous) {
+                            log.notice("\(report, privacy: .public)")
+                        }
+                        previous = stats
+                    }
+                }
+            }
+        }
     }
 
     /// Audio for the Android mic: an imported video's PCM sidecar, or the Mac.
@@ -437,6 +483,7 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
                         await agent.useBluetoothPort(port)
                     }
                     if line.hasPrefix("camera ") || line.hasPrefix("camerastats ") { cameras?.handle(line) }
+                    if line.hasPrefix("camera "), cameras != nil { self.watchCameraService(line, agent: agent) }
                     if line.hasPrefix("disk ") { self.diskFull.handle(line) }
                     bridge.handle(line)
                 }
@@ -470,6 +517,7 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
         }
         guard current else {
             for task in tasks { task.cancel() }
+            stopCameraServiceWatch()
             cameras?.stop()
             await control.close()
             let stopped = monitor?.isStopped == true || lock.withLock { stops != generation }
@@ -515,6 +563,7 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
         if asked { for _ in 0..<200 where process.isRunning { try? await Task.sleep(for: .milliseconds(100)) } }
         await Self.end(process)
         for task in tasks { task.cancel() }
+        stopCameraServiceWatch()
         let (cameras, control) = lock.withLock { (self.cameras, self.control) }
         cameras?.stop()
         await control?.close()
@@ -713,6 +762,7 @@ extension VMMEngine {
                     await Self.end(process)
                 }
                 for task in tasks { task.cancel() }
+                stopCameraServiceWatch()
                 await control?.close()
                 guard !Task.isCancelled else { return }
                 do {

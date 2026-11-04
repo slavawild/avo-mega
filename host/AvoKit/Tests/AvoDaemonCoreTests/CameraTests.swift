@@ -355,6 +355,38 @@ import Testing
         #expect(VideoFraming(rotation: 5).quarterTurns == 1 && VideoFraming(rotation: -1).quarterTurns == 3)
     }
 
+    /// cameraserver's dump of an app's streams turns into frames a second
+    /// for each: its preview and its recording, by camera and stream.
+    @Test func androidsStreamsAreCounted() {
+        func dump(preview: Int, recording: Int) -> String {
+            """
+            == Service global info: ==
+            Number of camera devices: 2
+            == Camera device 1 dynamic info: ==
+              Device 1 is open. Client instance dump:
+                Stream configuration:
+                  Stream[0]: Output
+                    Consumer name: SurfaceView - org.telegram.messenger/org.telegram.ui.LaunchActivity#0
+                    State: 4
+                    Dims: 640 x 480, format 0x22, dataspace 0x0
+                    Frames produced: \(preview), last timestamp: 123456 ns
+                  Stream[1]: Output
+                    Consumer name: GraphicBufferSource
+                    Dims: 384 x 384, format 0x22, dataspace 0x0
+                    Frames produced: \(recording), last timestamp: 123456 ns
+            """
+        }
+        let start = ContinuousClock.now
+        let first = CameraServiceStats(dump: dump(preview: 100, recording: 40), at: start)
+        #expect(first.streams.map(\.key) == ["1/0", "1/1"])
+        #expect(first.streams.map(\.description) == ["640x480 0x22 SurfaceView - org.telegram.messenger/org.telegram.ui.LaunchActivity#0",
+                                                     "384x384 0x22 GraphicBufferSource"])
+        let later = CameraServiceStats(dump: dump(preview: 250, recording: 135), at: start.advanced(by: .seconds(5)))
+        #expect(later.report(since: first)
+                == "android streams: camera 1/0 640x480 0x22 SurfaceView - org.telegram.messenger/org.telegram.ui.LaunchActivity#0: 30.0 fps; camera 1/1 384x384 0x22 GraphicBufferSource: 19.0 fps")
+        #expect(CameraServiceStats(dump: "", at: start).report(since: first) == nil)
+    }
+
     /// Phones record portrait movies sideways and say how to turn them.
     @Test func phoneMoviesAreTurnedUpright() {
         #expect(FileVideoCamera.orientation(.identity) == .up)
