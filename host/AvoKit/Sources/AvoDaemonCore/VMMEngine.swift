@@ -433,7 +433,9 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
                         cameras?.handle(line)
                         if case .on(let camera, _) = CameraFeed.parse(line),
                            camera == self.lock.withLock({ self.soundtrackCamera }) {
-                            try? await control.send("microphone sync")
+                            // Not awaited here: commands go one at a time, and
+                            // this pump must keep taking gpu and frame events.
+                            Task { try? await control.send("microphone sync") }
                         }
                     }
                     if line.hasPrefix("disk ") { self.diskFull.handle(line) }
