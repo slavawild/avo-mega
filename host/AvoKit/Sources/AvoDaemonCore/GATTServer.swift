@@ -214,7 +214,7 @@ actor GATTServer {
         guard let handle = database.valueHandle(of: characteristic), let configured = configuration[characteristic] else { return nil }
         let opcode: UInt8 = configured & 0x1 != 0 ? 0x1B : configured & 0x2 != 0 ? 0x1D : 0
         guard opcode != 0 else { return nil }
-        return [opcode] + le16(handle) + value.prefix(mtu - 3)
+        return [opcode] + le16(handle) + Array(value.prefix(mtu - 3))
     }
 
     // MARK: Requests

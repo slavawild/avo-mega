@@ -29,7 +29,7 @@ import Testing
         #expect(parts.map(\.seconds) == [600, 1200])
         // The night the clocks go back has 25 hours.
         let long = AppUsage.split(from: Self.date(25, 0, 0), to: Self.date(26, 0, 0), calendar: Self.calendar)
-        #expect(long.map(\.seconds) == [25 * 3600])
+        #expect(long.map(\.seconds) == [Double(25 * 3600)])
         #expect(AppUsage.split(from: Self.date(18, 10), to: Self.date(18, 10), calendar: Self.calendar).isEmpty)
     }
 
