@@ -240,10 +240,16 @@ static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 struct PCMVideoMic {
     data: *mut libc::c_void,
     bytes: usize,
+    /// The next output frame's place in the soundtrack, in its own frames.
     position: f64,
+    /// The low-pass for the rate Android records at (below 48 kHz).
+    filter: Option<Lowpass>,
 }
 // Only State's mutex owns and accesses this mapping.
 unsafe impl Send for PCMVideoMic {}
+
+/// The soundtrack sidecar's rate (VideoAudioExtractor).
+const SOUNDTRACK_RATE: u32 = 48_000;
 
 impl PCMVideoMic {
     fn open(path: &str) -> Option<Self> {
@@ -252,7 +258,7 @@ impl PCMVideoMic {
         if bytes < 4 || bytes % 4 != 0 { return None; }
         let data = unsafe { libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0) };
         if data == libc::MAP_FAILED { return None; }
-        Some(Self { data, bytes, position: 0.0 })
+        Some(Self { data, bytes, position: 0.0, filter: None })
     }
 
     fn sample(bytes: &[u8], frame: usize) -> (i16, i16) {
@@ -262,25 +268,131 @@ impl PCMVideoMic {
     }
 
     fn render(&mut self, params: Params, count: usize) -> Vec<u8> {
-        let frames = self.bytes / 4;
         let source = unsafe { std::slice::from_raw_parts(self.data.cast::<u8>(), self.bytes) };
-        let output_frames = count / (usize::from(params.channels) * 2).max(1);
-        let mut out = Vec::with_capacity(count);
-        let step = 48_000.0 / f64::from(params.rate);
-        for _ in 0..output_frames {
-            let index = (self.position as usize) % frames;
-            let (left, right) = Self::sample(source, index);
-            if params.channels == 1 {
-                let mono = ((i32::from(left) + i32::from(right)) / 2) as i16;
-                out.extend_from_slice(&mono.to_le_bytes());
-            } else {
-                out.extend_from_slice(&left.to_le_bytes());
-                out.extend_from_slice(&right.to_le_bytes());
-            }
-            self.position = (self.position + step) % frames as f64;
-        }
+        resample(source, &mut self.position, &mut self.filter, params.rate, params.channels, count)
+    }
+}
+
+/// `count` bytes of S16LE at `rate` with `channels` from the looping 48 kHz
+/// stereo `source`, from `position` on (which moves on past them).
+///
+/// Below 48 kHz the soundtrack goes through `Lowpass` first: picking every
+/// n-th sample would fold everything above the new Nyquist frequency back
+/// into what Android hears (8 and 16 kHz calls hear it as hiss and
+/// whistles). At 48 kHz it goes over as it is.
+fn resample(source: &[u8], position: &mut f64, filter: &mut Option<Lowpass>, rate: u32, channels: u8, count: usize) -> Vec<u8> {
+    let frames = source.len() / 4;
+    let mut out = Vec::with_capacity(count);
+    if frames == 0 || rate == 0 {
         out.resize(count, 0);
-        out
+        return out;
+    }
+    let channels = usize::from(channels).max(1);
+    let step = f64::from(SOUNDTRACK_RATE) / f64::from(rate);
+    if rate < SOUNDTRACK_RATE {
+        if filter.as_ref().map(|filter| filter.rate) != Some(rate) {
+            *filter = Some(Lowpass::new(rate));
+        }
+    } else {
+        *filter = None;
+    }
+    for _ in 0..count / (channels * 2) {
+        let (left, right) = match filter.as_ref() {
+            Some(filter) => filter.read(source, frames, *position),
+            None => interpolate(source, frames, *position),
+        };
+        if channels == 1 {
+            out.extend_from_slice(&pcm16((left + right) / 2.0).to_le_bytes());
+        } else {
+            out.extend_from_slice(&pcm16(left).to_le_bytes());
+            out.extend_from_slice(&pcm16(right).to_le_bytes());
+        }
+        *position = (*position + step) % frames as f64;
+    }
+    out.resize(count, 0);
+    out
+}
+
+/// The soundtrack between two of its frames (exact on a whole frame).
+fn interpolate(source: &[u8], frames: usize, position: f64) -> (f32, f32) {
+    let whole = position.floor();
+    let fraction = (position - whole) as f32;
+    let index = whole as usize % frames;
+    let (l0, r0) = PCMVideoMic::sample(source, index);
+    if fraction == 0.0 {
+        return (f32::from(l0), f32::from(r0));
+    }
+    let (l1, r1) = PCMVideoMic::sample(source, (index + 1) % frames);
+    (f32::from(l0) + (f32::from(l1) - f32::from(l0)) * fraction, f32::from(r0) + (f32::from(r1) - f32::from(r0)) * fraction)
+}
+
+fn pcm16(value: f32) -> i16 {
+    value.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
+}
+
+/// A windowed-sinc (Blackman) low-pass that reads the 48 kHz soundtrack at
+/// any place between its frames, for a lower rate: it passes up to 90% of
+/// that rate's Nyquist frequency and stops what lies above it, which would
+/// otherwise alias. Its taps are worked out once per rate, for `PHASES`
+/// places between two frames.
+struct Lowpass {
+    rate: u32,
+    /// Taps on each side of the place read.
+    half: usize,
+    /// `PHASES` rows of `2 * half` taps; row p reads p / PHASES of a frame
+    /// past a whole one, from `half - 1` frames before it on.
+    taps: Vec<f32>,
+}
+
+impl Lowpass {
+    const PHASES: usize = 256;
+    /// Zero crossings of the sinc kept on each side.
+    const ZEROS: f64 = 32.0;
+
+    fn new(rate: u32) -> Lowpass {
+        // The cutoff in cycles per soundtrack frame, and the sinc's spacing.
+        let cutoff = 0.9 * f64::from(rate) / (2.0 * f64::from(SOUNDTRACK_RATE));
+        let half = (Self::ZEROS / (2.0 * cutoff)).ceil() as usize;
+        let width = 2 * half;
+        let mut taps = Vec::with_capacity(Self::PHASES * width);
+        for phase in 0..Self::PHASES {
+            let fraction = phase as f64 / Self::PHASES as f64;
+            let row: Vec<f64> = (0..width)
+                .map(|j| {
+                    let t = j as f64 - (half as f64 - 1.0) - fraction;
+                    let x = 2.0 * cutoff * t;
+                    let sinc = if x == 0.0 { 1.0 } else { (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x) };
+                    let w = t / half as f64;
+                    let blackman = 0.42 + 0.5 * (std::f64::consts::PI * w).cos() + 0.08 * (2.0 * std::f64::consts::PI * w).cos();
+                    sinc * blackman.max(0.0)
+                })
+                .collect();
+            // Each row passes a steady level as it is (no gain, no ripple between phases).
+            let sum: f64 = row.iter().sum();
+            taps.extend(row.iter().map(|tap| (tap / sum) as f32));
+        }
+        Lowpass { rate, half, taps }
+    }
+
+    /// Left and right at `position` (soundtrack frames, looping).
+    fn read(&self, source: &[u8], frames: usize, position: f64) -> (f32, f32) {
+        let whole = position.floor();
+        let mut phase = ((position - whole) * Self::PHASES as f64).round() as usize;
+        let mut index = whole as isize;
+        if phase == Self::PHASES {
+            phase = 0;
+            index += 1;
+        }
+        let width = 2 * self.half;
+        let row = &self.taps[phase * width..(phase + 1) * width];
+        let first = index - self.half as isize + 1;
+        let (mut left, mut right) = (0.0f32, 0.0f32);
+        for (j, tap) in row.iter().enumerate() {
+            let (l, r) = PCMVideoMic::sample(source, (first + j as isize).rem_euclid(frames as isize) as usize);
+            left += tap * f32::from(l);
+            right += tap * f32::from(r);
+        }
+        (left, right)
     }
 }
 
@@ -1348,6 +1460,62 @@ extern "C" fn recorded(user: *mut c_void, queue: AudioQueueRef, buffer: *mut Aud
 mod tests {
     use super::*;
     use hvf::GuestRegion;
+
+    /// `frames` of 48 kHz stereo: `left(n)` on the left, silence on the right.
+    fn soundtrack(frames: usize, left: impl Fn(usize) -> f64) -> Vec<u8> {
+        (0..frames).flat_map(|n| {
+            let l = pcm16(left(n) as f32).to_le_bytes();
+            [l[0], l[1], 0, 0]
+        }).collect()
+    }
+
+    fn lefts(bytes: &[u8], channels: usize) -> Vec<f64> {
+        bytes.chunks_exact(2 * channels).map(|frame| f64::from(i16::from_le_bytes([frame[0], frame[1]]))).collect()
+    }
+
+    /// The level of a tone in `samples` (RMS), skipping the filter's start.
+    fn rms(samples: &[f64]) -> f64 {
+        let tail = &samples[samples.len() / 4..];
+        (tail.iter().map(|s| s * s).sum::<f64>() / tail.len() as f64).sqrt()
+    }
+
+    #[test]
+    fn the_soundtrack_goes_over_as_it_is_at_48_khz() {
+        let source = soundtrack(480, |n| n as f64 * 10.0);
+        let (mut position, mut filter) = (0.0, None);
+        let out = resample(&source, &mut position, &mut filter, 48_000, 2, 480 * 4);
+        assert_eq!(out, source);
+        assert!(filter.is_none());
+        // It loops: the next frame is the first again.
+        assert_eq!(position, 0.0);
+    }
+
+    #[test]
+    fn a_lower_rate_keeps_the_voice_and_stops_what_would_alias() {
+        let tone = |hz: f64| move |n: usize| 10_000.0 * (2.0 * std::f64::consts::PI * hz * n as f64 / 48_000.0).sin();
+        for (rate, kept, stopped) in [(8_000u32, 1_000.0, 7_000.0), (16_000, 3_000.0, 13_000.0), (44_100, 15_000.0, 23_000.0)] {
+            let frames = 48_000;
+            let level = |hz: f64| {
+                let source = soundtrack(frames, tone(hz));
+                let (mut position, mut filter) = (0.0, None);
+                let count = rate as usize / 2 * 2;
+                rms(&lefts(&resample(&source, &mut position, &mut filter, rate, 1, count), 1))
+            };
+            let full = 10_000.0 / 2.0f64.sqrt() / 2.0; // mono: left and silent right averaged
+            let (pass, stop) = (level(kept), level(stopped));
+            assert!((pass / full - 1.0).abs() < 0.05, "{rate} Hz: {kept} Hz at {pass} of {full}");
+            assert!(stop / full < 0.01, "{rate} Hz: {stopped} Hz at {stop} of {full}");
+        }
+    }
+
+    #[test]
+    fn a_steady_level_stays_the_same_through_the_filter() {
+        let source = soundtrack(4_800, |_| 1_234.0);
+        let (mut position, mut filter) = (0.0, None);
+        for value in lefts(&resample(&source, &mut position, &mut filter, 11_025, 2, 2_000 * 4), 2) {
+            assert_eq!(value, 1_234.0);
+        }
+    }
 
     #[test]
     fn pcm_video_sample_decodes_signed_stereo() {
