@@ -12,8 +12,16 @@ public enum CameraSource: Hashable, Sendable {
     case emulated
     /// One of this Mac's cameras (`AVCaptureDevice.uniqueID`).
     case mac(String)
+    /// A local MP4/MOV copied into Avo's Application Support folder.
+    /// The daemon decodes it only while Android streams the camera.
+    case video(String)
     /// None: Android does not have this camera.
     case none
+
+    public var videoFilePath: String? {
+        if case .video(let path) = self { return path }
+        return nil
+    }
 
     public var macCameraID: String? {
         if case .mac(let id) = self { return id }
@@ -22,12 +30,13 @@ public enum CameraSource: Hashable, Sendable {
 }
 
 extension CameraSource: Codable {
-    /// `emulated`, `none`, or `mac:<unique ID>`.
+    /// `emulated`, `none`, `mac:<unique ID>`, or `video:<absolute path>`.
     public var rawValue: String {
         switch self {
         case .emulated: "emulated"
         case .none: "none"
         case .mac(let id): "mac:" + id
+        case .video(let path): "video:" + path
         }
     }
 
@@ -36,6 +45,7 @@ extension CameraSource: Codable {
         case "emulated": self = .emulated
         case "none": self = .none
         case let value where value.hasPrefix("mac:") && value.count > 4: self = .mac(String(value.dropFirst(4)))
+        case let value where value.hasPrefix("video:/") && value.count > 7: self = .video(String(value.dropFirst(6)))
         default: return nil
         }
     }
