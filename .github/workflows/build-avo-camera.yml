@@ -9,10 +9,10 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: macOS runner image (macos-26 queued without a runner on 2026-11-04)
-        default: macos-15
+        description: macOS runner image
+        default: macos-26
         type: choice
-        options: [macos-15, macos-26]
+        options: [macos-26, macos-15]
 
 permissions:
   contents: read
@@ -25,10 +25,9 @@ concurrency:
 jobs:
   build:
     name: Build for Apple Silicon
-    # macos-15 with its newest Xcode 26 (the step below): the same SDK and
-    # Swift as macos-26, whose jobs waited 15 minutes for a runner and were
-    # cancelled twice. Run the workflow by hand to try macos-26 again.
-    runs-on: ${{ inputs.runner || 'macos-15' }}
+    # macos-26 by default; running the workflow by hand can pick macos-15,
+    # which builds with its newest Xcode 26 (the step below) all the same.
+    runs-on: ${{ inputs.runner || 'macos-26' }}
     timeout-minutes: 90
 
     steps:
