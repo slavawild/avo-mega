@@ -64,8 +64,13 @@ jobs:
           file.write_text(source.replace(old, new))
           PY
 
-      - name: Test virtio-sound engine
-        run: cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm
+      - name: Test virtio-sound engine (no Hypervisor on GitHub runners)
+        run: |
+          # GitHub-hosted macOS runs inside a VM. Two machine::pause_tests
+          # invoke hv_vm_create() and fail with HV_UNSUPPORTED there.
+          # Compile the entire test binary, then run sound/audio tests only.
+          cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm --no-run
+          cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm virtio::sound::
 
       - name: Test camera models and camera feed
         run: |
