@@ -1235,6 +1235,12 @@ struct VideoFramingControls: View {
         HazeSegmented(options: [(VideoFraming.Mode.fill, Text("Fill the picture")), (.fit, Text("Whole video"))],
                       selection: Binding(get: { framing.mode }, set: { framing.mode = $0 }))
             .accessibilityLabel(Text("Video framing"))
+        HStack(spacing: 10) {
+            Image(systemName: "rotate.right").foregroundStyle(Haze.textTertiary)
+            HazeSegmented(options: [(0, Text(verbatim: "0°")), (1, Text(verbatim: "90°")), (2, Text(verbatim: "180°")), (3, Text(verbatim: "270°"))],
+                          selection: Binding(get: { framing.quarterTurns }, set: { framing.rotation = $0 }))
+                .accessibilityLabel(Text("Turn the video clockwise"))
+        }
         if framing.mode == .fill {
             HStack(spacing: 10) {
                 Image(systemName: "arrow.left").foregroundStyle(Haze.textTertiary)

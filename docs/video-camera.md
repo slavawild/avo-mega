@@ -29,6 +29,7 @@ Below a camera that shows a video, **Fill the picture** and **Whole video** choo
 
 - **Fill the picture** (the default) covers the picture and crops the video; the slider picks which part shows — its left (or top) edge, its middle, or its right (or bottom) edge. A landscape video in a portrait app shows only a slice of its width, so this is where to aim it.
 - **Whole video** shows all of it, with black where it does not reach the picture's edges.
+- **0° / 90° / 180° / 270°** turns the video clockwise first, for one recorded on its side (or one you want on its side). It applies to either framing.
 
 A change shows in Android at the next frame, without restarting the video; the slider writes when it is let go. Apps mirror the front camera's preview, so there the slider's left shows on the right.
 

@@ -336,6 +336,15 @@ final class JPEGEncoder: @unchecked Sendable {
         }
     }
 
+    /// `image` turned `quarterTurns` quarters clockwise (its extent moves;
+    /// `placing` puts it back at the origin).
+    static func turned(_ image: CIImage, quarterTurns: Int) -> CIImage {
+        let turns = ((quarterTurns % 4) + 4) % 4
+        guard turns != 0 else { return image }
+        // y grows upward here: clockwise is a negative angle.
+        return image.transformed(by: CGAffineTransform(rotationAngle: -CGFloat(turns) * .pi / 2))
+    }
+
     /// `image` scaled to cover `width`×`height` and cropped to it, centered.
     static func filling(_ image: CIImage, width: Int, height: Int) -> CIImage {
         let extent = image.extent
@@ -556,13 +565,17 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
 
     /// The size to decode a movie at: as small as the portrait the phone
     /// shows (Android's frame turned, JPEGEncoder.sensorFrame) allows while
-    /// still covering it, in the movie's own (unturned) orientation, even
-    /// sides; nil when the movie is no bigger than that.
+    /// still covering it whichever way the movie is turned, in its own
+    /// (unturned) orientation, even sides; nil when the movie is no bigger
+    /// than that.
     static func decodeSize(natural: CGSize, orientation: CGImagePropertyOrientation, request: CameraFeed.Request) -> CGSize? {
         guard natural.width > 0, natural.height > 0 else { return nil }
-        let turned = orientation == .left || orientation == .right
-        let upright = turned ? CGSize(width: natural.height, height: natural.width) : natural
-        let scale = max(CGFloat(request.height) / upright.width, CGFloat(request.width) / upright.height)
+        // The framing can turn the video a quarter at any time without a
+        // new reader (VideoFraming.rotation): cover the portrait either way.
+        let covering = { (picture: CGSize) in
+            max(CGFloat(request.height) / picture.width, CGFloat(request.width) / picture.height)
+        }
+        let scale = max(covering(natural), covering(CGSize(width: natural.height, height: natural.width)))
         guard scale < 1 else { return nil }
         // Nearest even side (rounding up could turn 1280.0000001 into 1282).
         func even(_ side: CGFloat) -> CGFloat { max(16, (side / 2).rounded() * 2) }
@@ -677,7 +690,7 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
     }
 
     private func encode(_ pixels: CVPixelBuffer, _ orientation: CGImagePropertyOrientation, _ framing: VideoFraming) -> Data? {
-        let image = CIImage(cvPixelBuffer: pixels).oriented(orientation)
+        let image = JPEGEncoder.turned(CIImage(cvPixelBuffer: pixels).oriented(orientation), quarterTurns: framing.quarterTurns)
         return encoder.jpeg(JPEGEncoder.sensorFrame(image, width: request.width, height: request.height, framing: framing))
     }
 

@@ -19,6 +19,9 @@ import Testing
         #expect(config.effect(of: old) == .immediate)
         let decoded = try JSONDecoder().decode(VMConfig.self, from: JSONEncoder().encode(config))
         #expect(decoded.cameraVideoFraming == config.cameraVideoFraming)
+        // Framing from before rotation: unturned.
+        let older = Data(#"{"cameraVideoFraming": {"/a.mov": {"mode": "fit", "position": 0.5}}}"#.utf8)
+        #expect(try JSONDecoder().decode(VMConfig.self, from: older).cameraVideoFraming["/a.mov"] == VideoFraming(mode: .fit, position: 0.5))
         let unknown = Data(#"{"cameraVideoFraming": {"/a.mov": {"mode": "zoom", "position": 0}}}"#.utf8)
         #expect(try JSONDecoder().decode(VMConfig.self, from: unknown).cameraVideoFraming == [:])
         #expect(VideoFraming(position: 7).clampedPosition == 1 && VideoFraming(position: -.infinity).clampedPosition == 0)
@@ -298,17 +301,34 @@ import Testing
     }
 
     /// A movie is decoded no bigger than the turned portrait the camera
-    /// needs (Android's frame turned), in its own orientation, and as it
-    /// is when it is smaller.
+    /// needs (Android's frame turned) whichever way its framing turns it,
+    /// in its own orientation, and as it is when it is smaller.
     @Test func moviesAreDecodedAtTheSizeTheCameraNeeds() {
         let hd = CameraFeed.Request(width: 1280, height: 720, fps: 30)
         // 4K landscape: covering a 720×1280 portrait takes 1280 rows.
         #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 3840, height: 2160), orientation: .up, request: hd)
                 == CGSize(width: 2276, height: 1280))
-        // A phone's portrait movie, recorded sideways: 1080×1920 upright fills 720×1280 at two thirds.
-        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 1920, height: 1080), orientation: .right, request: hd)
-                == CGSize(width: 1280, height: 720))
+        // A 1920×1080 movie turned either way needs all its 1080 rows for 1280: as it is.
+        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 1920, height: 1080), orientation: .right, request: hd) == nil)
+        // 4K portrait: 3840 rows cover 1280 at a third, but turned its 2160 need 0.59.
+        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 2160, height: 3840), orientation: .up, request: hd)
+                == CGSize(width: 1280, height: 2276))
         #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 640, height: 360), orientation: .up, request: hd) == nil)
+    }
+
+    /// Turned a quarter clockwise, a picture's left edge is on top.
+    @Test func videosTurnAsTheirFramingSays() throws {
+        let red = CIImage(color: .red).cropped(to: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let blue = CIImage(color: .blue).cropped(to: CGRect(x: 100, y: 0, width: 100, height: 100))
+        let turned = JPEGEncoder.turned(red.composited(over: blue), quarterTurns: 1)
+        #expect(turned.extent.size == CGSize(width: 100, height: 200))
+        let placed = JPEGEncoder.placing(turned, width: 100, height: 200, framing: VideoFraming(mode: .fit))
+        let jpeg = try #require(JPEGEncoder().jpeg(placed))
+        let top = try #require(color(jpeg, x: 0.5, y: 0.1)), bottom = try #require(color(jpeg, x: 0.5, y: 0.9))
+        #expect(top.red > 150 && top.blue < 100, "the left edge on top: \(top)")
+        #expect(bottom.blue > 150 && bottom.red < 100, "the right edge below: \(bottom)")
+        #expect(JPEGEncoder.turned(turned, quarterTurns: 3).extent.size == CGSize(width: 200, height: 100))
+        #expect(VideoFraming(rotation: 5).quarterTurns == 1 && VideoFraming(rotation: -1).quarterTurns == 3)
     }
 
     /// Phones record portrait movies sideways and say how to turn them.

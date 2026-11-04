@@ -37,7 +37,8 @@ public enum CameraSource: Hashable, Sendable {
 
 /// How a camera's video fills the picture (Settings › Devices › Cameras):
 /// all of it, cropped where `position` says, or the whole video with black
-/// around it. Kept per video (`VMConfig.cameraVideoFraming`).
+/// around it, turned `rotation` quarters clockwise first. Kept per video
+/// (`VMConfig.cameraVideoFraming`).
 public struct VideoFraming: Codable, Hashable, Sendable {
     public enum Mode: String, Codable, Hashable, Sendable {
         /// The picture full, the video cropped to it.
@@ -50,11 +51,28 @@ public struct VideoFraming: Codable, Hashable, Sendable {
     /// Filling, which part of the video shows along the side it is cropped
     /// on: -1 its left (or top) edge, 0 its middle, 1 its right (or bottom).
     public var position: Double
+    /// Quarter turns clockwise of the upright video (0 to 3), for one that
+    /// was recorded on its side or should be.
+    public var rotation: Int
 
-    public init(mode: Mode = .fill, position: Double = 0) {
+    public init(mode: Mode = .fill, position: Double = 0, rotation: Int = 0) {
         self.mode = mode
         self.position = position
+        self.rotation = rotation
     }
+
+    private enum CodingKeys: String, CodingKey { case mode, position, rotation }
+
+    /// Framing saved before rotation existed has none.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        mode = try container.decode(Mode.self, forKey: .mode)
+        position = try container.decode(Double.self, forKey: .position)
+        rotation = try container.decodeIfPresent(Int.self, forKey: .rotation) ?? 0
+    }
+
+    /// `rotation` as 0, 1, 2 or 3 quarter turns clockwise.
+    public var quarterTurns: Int { ((rotation % 4) + 4) % 4 }
 
     /// `position` within -1…1.
     public var clampedPosition: Double { min(max(position.isFinite ? position : 0, -1), 1) }
