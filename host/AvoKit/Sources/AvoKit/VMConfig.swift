@@ -139,6 +139,8 @@ public struct VMConfig: Codable, Equatable, Sendable {
     public var camerasEnabled: Bool
     /// Android may use the Mac's microphone; off, it records silence.
     public var microphoneEnabled: Bool
+    /// Play the selected front (or back) camera MP4 soundtrack into Android's microphone.
+    public var microphoneVideoAudio: Bool
     /// Android has Bluetooth (with the Android Emulator's netsimd); off, none.
     public var bluetoothEnabled: Bool
     /// Text copied on the Mac reaches Android and the other way round.
@@ -164,7 +166,7 @@ public struct VMConfig: Codable, Equatable, Sendable {
                 wifiEnabled: Bool = true, networkSpeed: NetworkSpeed = .full, shareMacBluetooth: Bool = true,
                 cellularEnabled: Bool = false, mobileNetworkType: MobileNetworkType = .lte, cellularSignal: Int = 4,
                 backCamera: CameraSource = .emulated, frontCamera: CameraSource = .emulated,
-                camerasEnabled: Bool = true, microphoneEnabled: Bool = true, bluetoothEnabled: Bool = true,
+                camerasEnabled: Bool = true, microphoneEnabled: Bool = true, microphoneVideoAudio: Bool = false, bluetoothEnabled: Bool = true,
                 shareClipboard: Bool = true,
                 translationAtStartup: Bool = true,
                 createDesktopAlias: Bool = true, addToDock: Bool = false) {
@@ -205,6 +207,7 @@ public struct VMConfig: Codable, Equatable, Sendable {
         self.frontCamera = frontCamera
         self.camerasEnabled = camerasEnabled
         self.microphoneEnabled = microphoneEnabled
+        self.microphoneVideoAudio = microphoneVideoAudio
         self.bluetoothEnabled = bluetoothEnabled
         self.shareClipboard = shareClipboard
         self.translationAtStartup = translationAtStartup
@@ -301,7 +304,7 @@ public struct VMConfig: Codable, Equatable, Sendable {
         case appGraphics, gameGraphics, phoneGraphics, graphicsOverrides, performanceHUD
         case defaultWindowSize, appBarStyle, rooted, deviceProfileID, emulateHardware, gms, adbEnabled, adbPort, shareLocation, dockBadges
         case wifiEnabled, networkSpeed, shareMacBluetooth, cellularEnabled, mobileNetworkType, cellularSignal
-        case backCamera, frontCamera, camerasEnabled, microphoneEnabled, bluetoothEnabled, shareClipboard
+        case backCamera, frontCamera, camerasEnabled, microphoneEnabled, microphoneVideoAudio, bluetoothEnabled, shareClipboard
         case translationAtStartup
         case createDesktopAlias, addToDock
     }
@@ -383,6 +386,7 @@ public struct VMConfig: Codable, Equatable, Sendable {
         frontCamera = try value(.frontCamera, defaults.frontCamera)
         camerasEnabled = try value(.camerasEnabled, defaults.camerasEnabled)
         microphoneEnabled = try value(.microphoneEnabled, defaults.microphoneEnabled)
+        microphoneVideoAudio = try value(.microphoneVideoAudio, defaults.microphoneVideoAudio)
         bluetoothEnabled = try value(.bluetoothEnabled, defaults.bluetoothEnabled)
         shareClipboard = try value(.shareClipboard, defaults.shareClipboard)
         translationAtStartup = try value(.translationAtStartup, defaults.translationAtStartup)
@@ -579,6 +583,7 @@ extension VMConfig {
         // microphone and the clipboard follow at once.
         check(\.bluetoothEnabled, "bluetoothEnabled", .restartRequired)
         check(\.microphoneEnabled, "microphoneEnabled", .immediate)
+        check(\.microphoneVideoAudio, "microphoneVideoAudio", .immediate)
         check(\.shareClipboard, "shareClipboard", .immediate)
         check(\.translationAtStartup, "translationAtStartup", .immediate)
         // Shortcuts.
