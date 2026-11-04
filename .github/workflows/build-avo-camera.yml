@@ -7,6 +7,12 @@ on:
     branches:
       - feature/mp4-camera-source
   workflow_dispatch:
+    inputs:
+      runner:
+        description: macOS runner image (macos-26 queued without a runner on 2026-11-04)
+        default: macos-15
+        type: choice
+        options: [macos-15, macos-26]
 
 permissions:
   contents: read
@@ -19,7 +25,10 @@ concurrency:
 jobs:
   build:
     name: Build for Apple Silicon
-    runs-on: macos-26
+    # macos-15 with its newest Xcode 26 (the step below): the same SDK and
+    # Swift as macos-26, whose jobs waited 15 minutes for a runner and were
+    # cancelled twice. Run the workflow by hand to try macos-26 again.
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 90
 
     steps:
@@ -28,8 +37,19 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Use the newest Xcode 26
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XCODE" ]; then
+            echo "::error::No Xcode 26 on this runner; it has:"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+
       - name: Check toolchain
         run: |
+          sw_vers
           uname -m
           xcodebuild -version
           swift --version
