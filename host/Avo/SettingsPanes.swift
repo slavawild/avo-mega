@@ -1121,6 +1121,13 @@ struct CameraPicker: View {
                 }
             }
         }
+        .task { await lookForCameras() }
+        .onReceive(NotificationCenter.default.publisher(for: AVCaptureDevice.wasConnectedNotification)) { _ in
+            Task { await lookForCameras() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AVCaptureDevice.wasDisconnectedNotification)) { _ in
+            Task { await lookForCameras() }
+        }
         Button("Choose video file…") { importingVideo = true }
             .fileImporter(isPresented: $importingVideo, allowedContentTypes: [.mpeg4Movie, .movie]) { result in
                 do {
@@ -1144,13 +1151,6 @@ struct CameraPicker: View {
             Text(verbatim: videoImportError)
                 .foregroundStyle(.red)
                 .font(.caption)
-        }
-        .task { await lookForCameras() }
-        .onReceive(NotificationCenter.default.publisher(for: AVCaptureDevice.wasConnectedNotification)) { _ in
-            Task { await lookForCameras() }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: AVCaptureDevice.wasDisconnectedNotification)) { _ in
-            Task { await lookForCameras() }
         }
     }
 
