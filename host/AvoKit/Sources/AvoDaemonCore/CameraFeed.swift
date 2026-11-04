@@ -112,8 +112,14 @@ public final class CameraFeed: @unchecked Sendable {
         framingLock.withLock { framing[path] } ?? VideoFraming()
     }
 
-    /// A line of avo-vmm's event stream (others are ignored).
+    /// A line of avo-vmm's event stream (others are ignored). How a stream
+    /// went inside Android (`camerastats`, avo-vmm's virtio/media.rs) goes
+    /// to the log beside what the Mac sent.
     public func handle(_ line: String) {
+        if line.hasPrefix("camerastats ") {
+            logger.notice("\(line, privacy: .public)")
+            return
+        }
         guard let event = Self.parse(line) else { return }
         state.async { [self] in
             switch event {

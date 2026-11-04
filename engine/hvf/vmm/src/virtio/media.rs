@@ -503,12 +503,15 @@ impl State {
 
     /// Puts `jpeg` in the oldest queued buffer of streaming session `id`
     /// and returns it to the driver; no buffer queued, no frame.
-    fn deliver(&mut self, id: u32, jpeg: &[u8]) {
-        let Some(session) = self.sessions.get_mut(&id).filter(|s| s.streaming) else { return };
-        let Some(&index) = session.queue.front() else { return };
+    /// Hands `jpeg` to the guest in its oldest queued buffer; false when
+    /// it has none queued (it has not given the last ones back yet), and
+    /// the frame goes.
+    fn deliver(&mut self, id: u32, jpeg: &[u8]) -> bool {
+        let Some(session) = self.sessions.get_mut(&id).filter(|s| s.streaming) else { return false };
+        let Some(&index) = session.queue.front() else { return false };
         let buffer = &mut session.buffers[index];
         if jpeg.len() > buffer.length as usize {
-            return;
+            return false;
         }
         session.queue.pop_front();
         self.region.write(buffer.offset, jpeg);
@@ -525,6 +528,7 @@ impl State {
             self.events.pop_front();
         }
         self.flush_events();
+        true
     }
 
     fn flush_events(&mut self) {
@@ -554,13 +558,29 @@ impl State {
 
 /// Feeds streaming session `id` until `stop`: each new frame of its size as
 /// it comes; without one for two frame times the last again (for STALE),
-/// or gray.
+/// or gray. A frame that finds no buffer queued (Android has not given the
+/// last ones back yet) waits for one, tried again every `RETRY`, until a
+/// newer frame takes its place: the Mac's 30 a second and Android's
+/// buffers keep their own time, and a frame missed by a hair is not lost.
+/// Every few seconds the subscribers hear how it went
+/// (`camerastats`): frames that came from the Mac, frames Android took,
+/// frames that went because Android had no buffer queued, and repeats.
 fn stream(shared: Arc<Mutex<State>>, hub: &'static Hub, camera: usize, id: u32, format: Format, stop: Arc<AtomicBool>) {
     let interval = Duration::from_secs(1) / format.fps.max(1);
     let gray = Arc::new(camera::gray_jpeg(format.width, format.height, 128));
     let (mut seen, mut last, mut due) = (0, None::<(Arc<Vec<u8>>, Instant)>, Instant::now());
+    let mut stats = StreamStats::default();
+    let mut reported = Instant::now();
+    // A frame that found no buffer queued, to hand over once one is.
+    let mut pending: Option<Arc<Vec<u8>>> = None;
     while !stop.load(Ordering::Acquire) {
-        let fresh = hub.wait(camera, seen, due);
+        if reported.elapsed() >= STATS_INTERVAL {
+            hub.report(stats.line(camera, format, reported.elapsed()));
+            stats = StreamStats::default();
+            reported = Instant::now();
+        }
+        let until = if pending.is_some() { (Instant::now() + RETRY).min(due) } else { due };
+        let fresh = hub.wait(camera, seen, until);
         let now = Instant::now();
         let jpeg = match fresh {
             Some((sequence, frame)) => {
@@ -568,12 +588,22 @@ fn stream(shared: Arc<Mutex<State>>, hub: &'static Hub, camera: usize, id: u32, 
                 if (frame.width, frame.height) != (format.width, format.height) {
                     continue;
                 }
+                // The one before never found a buffer: this one replaces it.
+                if pending.take().is_some() {
+                    stats.no_buffer += 1;
+                }
+                stats.fed += 1;
                 last = Some((frame.jpeg.clone(), now));
                 due = now + interval * 2;
                 frame.jpeg
             }
+            None if pending.is_some() && now < due => pending.take().unwrap(),
             None => {
+                if pending.take().is_some() {
+                    stats.no_buffer += 1;
+                }
                 due = now + interval;
+                stats.repeated += 1;
                 match &last {
                     Some((jpeg, at)) if now - *at < camera::STALE => jpeg.clone(),
                     _ => gray.clone(),
@@ -584,7 +614,41 @@ fn stream(shared: Arc<Mutex<State>>, hub: &'static Hub, camera: usize, id: u32, 
         if stop.load(Ordering::Acquire) {
             return;
         }
-        state.deliver(id, &jpeg);
+        if state.deliver(id, &jpeg) {
+            stats.taken += 1;
+        } else {
+            pending = Some(jpeg);
+        }
+    }
+}
+
+/// How soon a frame that found no buffer queued is tried again.
+const RETRY: Duration = Duration::from_millis(2);
+
+/// How often a stream reports (`camerastats`).
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct StreamStats {
+    /// New frames from the Mac.
+    fed: u32,
+    /// Frames (new or repeated) Android took.
+    taken: u32,
+    /// Frames that went: Android had no buffer queued before a newer one came.
+    no_buffer: u32,
+    /// The last frame (or gray) again, none newer having come.
+    repeated: u32,
+}
+
+impl StreamStats {
+    /// `camerastats <index> <w>x<h> <fps> fed <n>/s taken <n>/s no-buffer <n>/s repeated <n>/s`.
+    fn line(&self, camera: usize, format: Format, over: Duration) -> String {
+        let rate = |n: u32| n as f64 / over.as_secs_f64().max(0.001);
+        format!(
+            "camerastats {camera} {}x{} {} fed {:.1}/s taken {:.1}/s no-buffer {:.1}/s repeated {:.1}/s",
+            format.width, format.height, format.fps,
+            rate(self.fed), rate(self.taken), rate(self.no_buffer), rate(self.repeated)
+        )
     }
 }
 

@@ -56,6 +56,7 @@ Video FPS follows the Android camera stream request. The movie is decoded in ord
 - `CameraFeed.sensorOrientation` and `JPEGEncoder.sensorFrame` turn every source's picture as a phone's sensor would; `GuestCamera.config` declares the same orientation to the HAL.
 - `FileVideoCamera` decodes the movie sequentially with `AVAssetReader` on a dispatch timer. It sends the frame due at the elapsed time, starts a new reader at the asset duration and encodes/crops into the requested JPEG frame size, turning phone videos upright from the track's preferred transform.
 - `CameraFeed` connects the new producer to the existing virtio-media / Android HAL path.
+- Frame rate can be followed with `log stream --predicate 'category == "cameras"' --info`: `camera video:` lines say what the Mac sent and what decoding and encoding took; `camerastats` lines (avo-vmm's virtio-media device) say how many frames Android took, how many found no buffer queued, and how many were repeats. A frame that finds no buffer waits for one (retried every 2 ms) until a newer frame replaces it.
 - `VideoAudioExtractor` decodes local MP4 audio into a PCM sidecar; `virtio/sound.rs` feeds it into Android capture without Core Audio permissions.
 - `CameraVideos` copies the chosen file to a stable user-local location, builds the sidecar off the main actor, lists the imported videos and prunes old ones.
 

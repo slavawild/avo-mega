@@ -436,7 +436,7 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
                     if line.hasPrefix("bluetooth hci "), let port = line.split(separator: " ").last.flatMap({ UInt16($0) }) {
                         await agent.useBluetoothPort(port)
                     }
-                    if line.hasPrefix("camera ") { cameras?.handle(line) }
+                    if line.hasPrefix("camera ") || line.hasPrefix("camerastats ") { cameras?.handle(line) }
                     if line.hasPrefix("disk ") { self.diskFull.handle(line) }
                     bridge.handle(line)
                 }
