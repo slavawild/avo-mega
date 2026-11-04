@@ -45,6 +45,26 @@ jobs:
         continue-on-error: true
         run: make gfxstream
 
+      - name: Work around Swift 6.3 diagnostic crash in pinned avo_kit
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          file = Path("vendor/avo_kit/Sources/AvoKeymapUI/KeymapEditorView.swift")
+          source = file.read_text()
+          old = "let dropTarget = padDrag.flatMap { dropTarget(for: $0.element, at: $0.at) }"
+          new = """let dropTarget: String?
+                  if let padDrag {
+                      dropTarget = self.dropTarget(for: padDrag.element, at: padDrag.at)
+                  } else {
+                      dropTarget = nil
+                  }"""
+          assert old in source, "upstream source has changed; remove workaround"
+          file.write_text(source.replace(old, new))
+          PY
+
+      - name: Test virtio-sound engine
+        run: cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm
+
       - name: Test camera models and camera feed
         run: |
           cd host/AvoKit
