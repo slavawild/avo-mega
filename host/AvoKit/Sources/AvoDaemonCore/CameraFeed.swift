@@ -415,15 +415,37 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
         /// Seconds; the loop's length.
         let duration: Double
         let orientation: CGImagePropertyOrientation
+        /// As recorded, before `orientation` turns it upright.
+        let naturalSize: CGSize
+    }
+
+    /// A decoded picture handed to the encoder's queue (read only there).
+    private struct Pixels: @unchecked Sendable {
+        let buffer: CVPixelBuffer
     }
 
     private let asset: AVURLAsset
     private let request: CameraFeed.Request
     private let deliver: @Sendable (Data) -> Void
+    /// Turning, framing and JPEG encoding run on a queue of their own, so
+    /// the clock and the decoding on `queue` never wait for them: a frame
+    /// whose encoding is not done yet is replaced by the last one sent.
     private let encoder = JPEGEncoder()
+    private let encodeQueue = DispatchQueue(label: "com.avodroid.cameras.video.encode")
     private let clock = ContinuousClock()
+    private let logger = Logger(subsystem: AvoIdentifiers.logSubsystem, category: "cameras")
     /// Everything below changes on `queue` only.
     private let queue = DispatchQueue(label: "com.avodroid.cameras.video")
+    /// A picture is on `encodeQueue`; a newer one waits for the next tick.
+    private var encoding = false
+    private var newPixels = false
+    /// Decode at the size the camera needs (`decodeSize`); off when this
+    /// movie's decoder refused to scale, so it decodes as recorded.
+    private var scaledDecoding = true
+    /// What the log says every five seconds (category "cameras"): frames
+    /// sent and newly encoded, and the time decoding and encoding took.
+    private var stats = (sent: 0, encoded: 0, decode: Duration.zero, encode: Duration.zero)
+    private var statsSince: ContinuousClock.Instant?
     private var stopped = false
     private var movie: Movie?
     private var timer: DispatchSourceTimer?
@@ -457,9 +479,11 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
             // VM keeps its own gray fallback.
             guard let track = try? await asset.loadTracks(withMediaType: .video).first,
                   let duration = try? await asset.load(.duration), duration.isNumeric, duration.seconds > 0,
-                  let transform = try? await track.load(.preferredTransform)
+                  let transform = try? await track.load(.preferredTransform),
+                  let naturalSize = try? await track.load(.naturalSize)
             else { return }
-            let movie = Movie(track: track, duration: duration.seconds, orientation: Self.orientation(transform))
+            let movie = Movie(track: track, duration: duration.seconds, orientation: Self.orientation(transform),
+                              naturalSize: naturalSize)
             guard let self else { return }
             queue.async { self.begin(movie) }
         }
@@ -498,15 +522,45 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
         output = nil
         next = nil
         guard let movie, let reader = try? AVAssetReader(asset: asset) else { return }
-        let output = AVAssetReaderTrackOutput(track: movie.track, outputSettings: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-        ])
+        var settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+        let size = scaledDecoding ? Self.decodeSize(natural: movie.naturalSize, orientation: movie.orientation, request: request) : nil
+        if let size {
+            // The decoder scales (in hardware where it can): a 4K movie is
+            // not decoded at 4K for a 720p camera.
+            settings[kCVPixelBufferWidthKey as String] = Int(size.width)
+            settings[kCVPixelBufferHeightKey as String] = Int(size.height)
+        }
+        let output = AVAssetReaderTrackOutput(track: movie.track, outputSettings: settings)
         output.alwaysCopiesSampleData = false
-        guard reader.canAdd(output) else { return }
+        guard reader.canAdd(output) else { return refuseScaling(size) }
         reader.add(output)
-        guard reader.startReading() else { return }
+        guard reader.startReading() else { return refuseScaling(size) }
         self.reader = reader
         self.output = output
+    }
+
+    /// On `queue`: a reader that would not decode at `size` starts again
+    /// decoding as recorded (once; nothing more to try without a size).
+    private func refuseScaling(_ size: CGSize?) {
+        guard size != nil, scaledDecoding else { return }
+        logger.notice("camera video: the decoder does not scale this movie; it decodes at its own size")
+        scaledDecoding = false
+        rewind()
+    }
+
+    /// The size to decode a movie at: as small as the portrait the phone
+    /// shows (Android's frame turned, JPEGEncoder.sensorFrame) allows while
+    /// still covering it, in the movie's own (unturned) orientation, even
+    /// sides; nil when the movie is no bigger than that.
+    static func decodeSize(natural: CGSize, orientation: CGImagePropertyOrientation, request: CameraFeed.Request) -> CGSize? {
+        guard natural.width > 0, natural.height > 0 else { return nil }
+        let turned = orientation == .left || orientation == .right
+        let upright = turned ? CGSize(width: natural.height, height: natural.width) : natural
+        let scale = max(CGFloat(request.height) / upright.width, CGFloat(request.width) / upright.height)
+        guard scale < 1 else { return nil }
+        // Nearest even side (rounding up could turn 1280.0000001 into 1282).
+        func even(_ side: CGFloat) -> CGFloat { max(16, (side / 2).rounded() * 2) }
+        return CGSize(width: even(natural.width * scale), height: even(natural.height * scale))
     }
 
     /// On `queue`, once per frame Android wants.
@@ -523,18 +577,66 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
             seconds -= loops * movie.duration
             rewind()
         }
-        let framing = self.framing()
+        let decodeStart = clock.now
         if let frame = latestFrame(upTo: seconds) {
             lastPixels = frame
-        } else if framing == lastFraming {
-            if let last { deliver(last) }
+            newPixels = true
+            stats.decode += decodeStart.duration(to: clock.now)
+        }
+        let framing = self.framing()
+        if !encoding, newPixels || framing != lastFraming, let pixels = lastPixels {
+            // The encoder sends this tick's frame when it is done.
+            newPixels = false
+            encoding = true
+            startEncoding(Pixels(buffer: pixels), movie.orientation, framing)
+        } else if let last {
+            deliver(last)
+            stats.sent += 1
+        }
+        reportStats()
+    }
+
+    /// On `queue`: hands a picture to `encodeQueue`, which turns, frames and
+    /// encodes it, then sends it from `queue` (not after `stop`).
+    private func startEncoding(_ pixels: Pixels, _ orientation: CGImagePropertyOrientation, _ framing: VideoFraming) {
+        encodeQueue.async { [self] in
+            let start = clock.now
+            let jpeg = encode(pixels.buffer, orientation, framing)
+            let took = start.duration(to: clock.now)
+            queue.async { [self] in
+                encoding = false
+                guard !stopped else { return }
+                stats.encode += took
+                guard let jpeg else { return }
+                last = jpeg
+                lastFraming = framing
+                deliver(jpeg)
+                stats.sent += 1
+                stats.encoded += 1
+            }
+        }
+    }
+
+    /// On `queue`: every five seconds, what the camera sent and what that took.
+    private func reportStats() {
+        let now = clock.now
+        guard let since = statsSince else {
+            statsSince = now
             return
         }
-        if let pixels = lastPixels, let jpeg = encode(pixels, movie.orientation, framing) {
-            last = jpeg
-            lastFraming = framing
+        let elapsed = since.duration(to: now)
+        guard elapsed >= .seconds(5) else { return }
+        let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+        func ms(_ total: Duration, _ count: Int) -> String {
+            let value = (Double(total.components.seconds) * 1000 + Double(total.components.attoseconds) / 1e15) / Double(max(count, 1))
+            return String(format: "%.1f", value)
         }
-        if let last { deliver(last) }
+        let fps = String(format: "%.1f", Double(stats.sent) / seconds), newFPS = String(format: "%.1f", Double(stats.encoded) / seconds)
+        let decodeMs = ms(stats.decode, stats.encoded), encodeMs = ms(stats.encode, stats.encoded)
+        let asked = "\(request.fps) fps at \(request.width)×\(request.height)"
+        logger.notice("camera video: \(fps, privacy: .public) fps sent (\(newFPS, privacy: .public) new) for \(asked, privacy: .public); decode \(decodeMs, privacy: .public) ms, encode \(encodeMs, privacy: .public) ms a frame")
+        stats = (0, 0, .zero, .zero)
+        statsSince = now
     }
 
     /// On `queue`: decodes up to `seconds` into the movie and returns the
@@ -546,7 +648,17 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
                 // At the end of the movie the reader is done, and asking it
                 // again raises (its status is no longer reading): the last
                 // frame stays up until the loop starts over.
-                guard let reader, reader.status == .reading, let sample = output?.copyNextSampleBuffer() else { break }
+                guard let reader, reader.status == .reading else { break }
+                guard let sample = output?.copyNextSampleBuffer() else {
+                    // A decoder that took the size but cannot scale fails here.
+                    if reader.status == .failed, scaledDecoding {
+                        scaledDecoding = false
+                        logger.notice("camera video: decoding at the camera's size failed (\(String(describing: reader.error), privacy: .public)); decoding at the movie's own size")
+                        rewind()
+                        continue
+                    }
+                    break
+                }
                 next = sample
             }
             guard let sample = next else { break }

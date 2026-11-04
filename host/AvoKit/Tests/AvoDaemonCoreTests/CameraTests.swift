@@ -297,6 +297,20 @@ import Testing
         #expect(isRed(whole[0]) && isBlue(whole[1]) && isBlack(whole[2]), "all of it, black above: \(whole)")
     }
 
+    /// A movie is decoded no bigger than the turned portrait the camera
+    /// needs (Android's frame turned), in its own orientation, and as it
+    /// is when it is smaller.
+    @Test func moviesAreDecodedAtTheSizeTheCameraNeeds() {
+        let hd = CameraFeed.Request(width: 1280, height: 720, fps: 30)
+        // 4K landscape: covering a 720×1280 portrait takes 1280 rows.
+        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 3840, height: 2160), orientation: .up, request: hd)
+                == CGSize(width: 2276, height: 1280))
+        // A phone's portrait movie, recorded sideways: 1080×1920 upright fills 720×1280 at two thirds.
+        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 1920, height: 1080), orientation: .right, request: hd)
+                == CGSize(width: 1280, height: 720))
+        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 640, height: 360), orientation: .up, request: hd) == nil)
+    }
+
     /// Phones record portrait movies sideways and say how to turn them.
     @Test func phoneMoviesAreTurnedUpright() {
         #expect(FileVideoCamera.orientation(.identity) == .up)
