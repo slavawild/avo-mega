@@ -2,12 +2,13 @@
 
 DERIVED ?= build/DerivedData
 
-.PHONY: help test project build strings agent helpers gfxstream proto icons clean
+.PHONY: help test project build avo-kit strings agent helpers gfxstream proto icons clean
 
 help:
 	@echo "make test     run the host core tests (swift test)"
 	@echo "make project  generate host/Avo.xcodeproj (XcodeGen)"
 	@echo "make build    build Avo.app (Debug) into $(DERIVED)"
+	@echo "make avo-kit  apply Avo's patches to vendor/avo_kit (build and test do it first)"
 	@echo "make strings  update the String Catalogs from the last build"
 	@echo "make agent    build the Bridge Agent APK (Android SDK + NDK)"
 	@echo "make helpers  rebuild the guest helpers embedded in the daemon (clipboard, links, macstate, fingerprint, gpuprofile, gfxsync, widgets)"
@@ -15,14 +16,17 @@ help:
 	@echo "make proto    regenerate protocol bindings"
 	@echo "make icons    regenerate brand assets"
 
-test:
+test: avo-kit
 	cd host/AvoKit && swift test
 	cd vendor/avo_kit && swift test
 
 project:
 	cd host && xcodegen generate
 
-build: project
+avo-kit:
+	scripts/patch-avo-kit.sh
+
+build: avo-kit project
 	xcodebuild -project host/Avo.xcodeproj -scheme Avo -configuration Debug -derivedDataPath $(DERIVED) build
 
 strings:

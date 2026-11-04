@@ -1,0 +1,20 @@
+diff --git a/Sources/AvoKeymapUI/KeymapEditorView.swift b/Sources/AvoKeymapUI/KeymapEditorView.swift
+index 0fe96ad..d15793d 100644
+--- a/Sources/AvoKeymapUI/KeymapEditorView.swift
++++ b/Sources/AvoKeymapUI/KeymapEditorView.swift
+@@ -2171,7 +2171,14 @@ final class KeymapEditorView: NSView {
+         let zoned = shownControls.filter { $0.clickZone != nil && $0.canHaveClickZone }
+         // Lit as if selected: where a dragged part of the controller would
+         // bind, and what the part under the pointer in the panel drives.
+-        let dropTarget = padDrag.flatMap { dropTarget(for: $0.element, at: $0.at) }
++        // Not padDrag.flatMap { dropTarget(for:at:) }: Swift 6.3 crashes
++        // diagnosing that closure, whose call shares the constant's name.
++        let dropTarget: String?
++        if let padDrag {
++            dropTarget = self.dropTarget(for: padDrag.element, at: padDrag.at)
++        } else {
++            dropTarget = nil
++        }
+         let lit = Set(padHover.map { profile.controls(boundTo: $0).map(\.id) } ?? []).union(dropTarget.map { [$0] } ?? [])
+         // Areas under everything: the eye's swipe area, then the click areas.
+         for control in shown where isEye(control) {
