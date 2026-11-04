@@ -33,6 +33,7 @@
 //!                                     (virtio/sound.rs; off, records silence)
 //! microphone mac|file <path>          use the Mac microphone or an imported
 //!                                     48 kHz stereo S16LE PCM soundtrack
+//! microphone sync                     restart file audio when video camera starts
 //! tap <x> <y> / swipe <x1> <y1> <x2> <y2> [ms]   pixels of scanout 0 (debugging)
 //! pause                              stop the vCPUs (pause.rs); `ok` once none
 //!                                     runs guest code, an error when one does
@@ -398,6 +399,7 @@ impl Controls {
                 Some("on") => crate::virtio::sound::MICROPHONE.set(true),
                 Some("off") => crate::virtio::sound::MICROPHONE.set(false),
                 Some("mac") => crate::virtio::sound::MICROPHONE.set_file(None),
+                Some("sync") => crate::virtio::sound::MICROPHONE.sync_video(),
                 Some("file") => {
                     // Paths may contain spaces; preserve everything after the prefix.
                     let path = line.strip_prefix("microphone file ").ok_or("microphone file needs a path")?.trim();
@@ -406,7 +408,7 @@ impl Controls {
                     }
                     crate::virtio::sound::MICROPHONE.set_file(Some(path.to_owned()));
                 }
-                _ => return Err("microphone on|off|mac|file <path>".into()),
+                _ => return Err("microphone on|off|mac|sync|file <path>".into()),
             },
             Some("location") => {
                 if words.get(1) == Some(&"off") {
