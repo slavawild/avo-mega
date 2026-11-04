@@ -141,25 +141,32 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
         if case let .gpu(emulator) = gpu { gpuFlags = ["--gpu", "gfxstream", "--gfxstream-dir", emulator.directory.path] }
         // Android's data elsewhere (an external drive): the disks that belong
         // with it are there too; frames and logs stay on this Mac.
-        let disks = paths.dataDisks.standardizedFileURL.path == paths.instance.standardizedFileURL.path
+        let disks: [String] = paths.dataDisks.standardizedFileURL.path == paths.instance.standardizedFileURL.path
             ? [] : ["--disks", paths.dataDisks.path]
         // Display 0 is Android's own screen; app windows get their own displays.
-        return ["cuttlefish", images.path,
-                "--instance", paths.instance.path,
-                "--runtime", paths.runtime.path,
-                "--userdata", paths.dataDisk.path] + disks + [
-                "--cpus", "\(config.cpuCount)",
-                "--mem", "\(config.androidMemoryMiB(profile: launch.profile, host: host))",
-                "--display", "\(launch.androidScreen.width)x\(launch.androidScreen.height)",
-                "--density", "\(launch.androidScreen.dpi)",
-                "--properties", identityFile(paths).path]
-                + (launch.exitOnReboot ? ["--exit-on-reboot"] : [])
-                + gpuFlags + sharedFolderFlags(config) + refreshRateFlags(launch.displayRate)
-                + (bluetooth.map { ["--bluetooth", $0.path] } ?? [])
-                + (initBoot.map { ["--init-boot", $0.path] } ?? [])
-                + config.cameraFlags
-                + (config.microphoneEnabled ? [] : ["--no-microphone"])
-                + cpuFlags(launch) + hardwareFlags(launch)
+        // Built in steps: as one expression it is more than Swift's type
+        // checker takes in reasonable time on a slower Mac.
+        var arguments: [String] = ["cuttlefish", images.path,
+                                   "--instance", paths.instance.path,
+                                   "--runtime", paths.runtime.path,
+                                   "--userdata", paths.dataDisk.path]
+        arguments += disks
+        arguments += ["--cpus", "\(config.cpuCount)",
+                      "--mem", "\(config.androidMemoryMiB(profile: launch.profile, host: host))",
+                      "--display", "\(launch.androidScreen.width)x\(launch.androidScreen.height)",
+                      "--density", "\(launch.androidScreen.dpi)",
+                      "--properties", identityFile(paths).path]
+        if launch.exitOnReboot { arguments.append("--exit-on-reboot") }
+        arguments += gpuFlags
+        arguments += sharedFolderFlags(config)
+        arguments += refreshRateFlags(launch.displayRate)
+        if let bluetooth { arguments += ["--bluetooth", bluetooth.path] }
+        if let initBoot { arguments += ["--init-boot", initBoot.path] }
+        arguments += config.cameraFlags
+        if !config.microphoneEnabled { arguments.append("--no-microphone") }
+        arguments += cpuFlags(launch)
+        arguments += hardwareFlags(launch)
+        return arguments
     }
 
     /// Audio for the Android mic: an imported video's PCM sidecar, or the Mac.
