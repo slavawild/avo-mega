@@ -100,7 +100,6 @@ mod disk;
 mod fdt;
 mod frames;
 mod gnss;
-mod jpeg;
 mod link;
 mod machine;
 mod memory;

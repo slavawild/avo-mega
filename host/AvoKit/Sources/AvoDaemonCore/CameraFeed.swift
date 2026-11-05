@@ -288,13 +288,10 @@ protocol CameraProducer: AnyObject, Sendable {
 final class JPEGEncoder: @unchecked Sendable {
     private let context = CIContext(options: [.cacheIntermediates: false, .name: "Avo cameras"])
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
-    /// Rendered, then written by ImageIO as the Emulated camera's are
-    /// (DrawnCamera.jpeg). Core Image's own JPEGs (`jpegRepresentation`)
-    /// reached Android whole, yet apps recorded about 18 of their 30 frames
-    /// a second where the Emulated camera's gave 30.
+    private let quality = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
+
     func jpeg(_ image: CIImage) -> Data? {
-        guard let picture = context.createCGImage(image, from: image.extent, format: .BGRA8, colorSpace: colorSpace) else { return nil }
-        return DrawnCamera.jpeg(picture)
+        context.jpegRepresentation(of: image, colorSpace: colorSpace, options: [quality: 0.8])
     }
 
     /// An upright picture as the turned sensor gives it (CameraFeed.sensorOrientation):
