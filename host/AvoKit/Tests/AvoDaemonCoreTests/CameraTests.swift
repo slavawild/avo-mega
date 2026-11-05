@@ -481,7 +481,8 @@ import UniformTypeIdentifiers
             frames.lock.withLock { frames.all.append(jpeg) }
         }, framing: { frames.lock.withLock { frames.framing } })
         camera.start()
-        try await Task.sleep(for: .milliseconds(500))
+        // Reading the picture can take a while on a busy machine: wait for its frames.
+        for _ in 0..<150 where frames.lock.withLock({ frames.all.count }) < 4 { try await Task.sleep(for: .milliseconds(20)) }
         let still = frames.lock.withLock { frames.all }
         #expect(still.count >= 4, "frames keep coming: \(still.count)")
         #expect(Set(still).count == 1, "the same JPEG every frame")
@@ -489,7 +490,7 @@ import UniformTypeIdentifiers
         #expect(still.first.flatMap(centerColor).map { $0.red > 150 && $0.blue < 100 } ?? false)
         // Zoomed out on black: a new JPEG.
         frames.lock.withLock { frames.framing = VideoFraming(mode: .fit, zoom: 0.5) }
-        try await Task.sleep(for: .milliseconds(300))
+        for _ in 0..<150 where Set(frames.lock.withLock { frames.all }).count < 2 { try await Task.sleep(for: .milliseconds(20)) }
         camera.stop()
         #expect(Set(frames.lock.withLock { frames.all }).count == 2)
     }
