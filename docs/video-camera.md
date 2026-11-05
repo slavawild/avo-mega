@@ -47,7 +47,7 @@ Video FPS follows the Android camera stream request. The movie is decoded in ord
 
 - This is a first implementation. It has **not been built or exercised on a macOS machine yet**; compatibility needs validation.
 - Video selection is intentionally handled by the Avo macOS Control Panel. The user confirmed that an Android-side file picker is unnecessary.
-- Each import makes a new copy. Avo keeps the copies a camera shows and the five newest others; older ones are deleted at the next import.
+- Each import makes a new copy. Avo keeps the copies a camera shows and the five newest others; older ones are deleted at the next import. **Remove video** (beside Choose video file…) deletes any of them now, or all that no camera shows; a camera showing the removed video goes back to Emulated, and the other camera's video cannot be removed from this camera's menu.
 - Source is saved as an absolute path; if files are moved or deleted, Avo cannot decode them.
 - Invalid video files will result in the VM's ordinary gray/no-frame fallback. An unsupported or missing audio track yields silence in video-mic mode.
 - When both cameras use a default emulated AOSP pipeline, selecting the file after Android starts needs a restart. This follows the existing camera configuration design.

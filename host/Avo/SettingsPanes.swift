@@ -595,9 +595,9 @@ struct SystemPane: View {
                 if config.camerasEnabled {
                     let videos = Set([config.backCamera, config.frontCamera].compactMap(\.videoFilePath))
                     let framing = Binding(get: { config.cameraVideoFraming }, set: { value in model.update { $0.cameraVideoFraming = value } })
-                    CameraPicker(title: "Back camera", videosInUse: videos, framing: framing,
+                    CameraPicker(title: "Back camera", videosInUse: videos, otherVideo: config.frontCamera.videoFilePath, framing: framing,
                                  selection: Binding(get: { config.backCamera }, set: { value in model.update { $0.backCamera = value } }))
-                    CameraPicker(title: "Front camera", videosInUse: videos, framing: framing,
+                    CameraPicker(title: "Front camera", videosInUse: videos, otherVideo: config.backCamera.videoFilePath, framing: framing,
                                  selection: Binding(get: { config.frontCamera }, set: { value in model.update { $0.frontCamera = value } }))
                 }
                 RestartNote(text: "Turning cameras on or off, or giving Android a Mac camera, a video or no camera, applies when Android restarts; switching between cameras after that applies at once.")
@@ -1110,6 +1110,8 @@ struct CameraPicker: View {
     let title: LocalizedStringKey
     /// The videos both cameras show, kept when old copies go.
     let videosInUse: Set<String>
+    /// The video the other camera shows: not to be removed from here.
+    let otherVideo: String?
     /// How each video fills the picture (VMConfig.cameraVideoFraming).
     @Binding var framing: [String: VideoFraming]
     @Binding var selection: CameraSource
@@ -1147,16 +1149,22 @@ struct CameraPicker: View {
             await lookForMovies()
             await lookForCameras()
         }
-        // A video chosen for either camera, from either picker.
+        // A video chosen for either camera, from either picker, or one imported or removed.
         .onChange(of: videosInUse) { Task { await lookForMovies() } }
+        .onReceive(NotificationCenter.default.publisher(for: CameraVideos.changed)) { _ in
+            Task { await lookForMovies() }
+        }
         .onReceive(NotificationCenter.default.publisher(for: AVCaptureDevice.wasConnectedNotification)) { _ in
             Task { await lookForCameras() }
         }
         .onReceive(NotificationCenter.default.publisher(for: AVCaptureDevice.wasDisconnectedNotification)) { _ in
             Task { await lookForCameras() }
         }
-        Button("Choose video file…") { importingVideo = true }
-            .disabled(processingVideo)
+        HStack(spacing: 12) {
+            Button("Choose video file…") { importingVideo = true }
+                .disabled(processingVideo)
+            removeVideoMenu
+        }
             .fileImporter(isPresented: $importingVideo, allowedContentTypes: [.mpeg4Movie, .movie]) { result in
                 let url: URL
                 do {
@@ -1178,6 +1186,7 @@ struct CameraPicker: View {
                     processingVideo = false
                     switch outcome {
                     case .success(let movie):
+                        NotificationCenter.default.post(name: CameraVideos.changed, object: nil)
                         await lookForMovies()
                         selection = .video(movie.path)
                         videoImportError = movie.note
@@ -1203,6 +1212,49 @@ struct CameraPicker: View {
                 .font(.mona(12))
                 .foregroundStyle(Haze.danger)
                 .hazeRowNote()
+        }
+    }
+
+    /// Imported videos to let go of: any but the one the other camera shows
+    /// (this camera, showing the one removed, goes back to Emulated), or all
+    /// that neither camera shows.
+    private var removeVideoMenu: some View {
+        let others = Set([otherVideo].compactMap { $0 })
+        let unused = movies.filter { !videosInUse.contains($0.path) }
+        return Menu {
+            ForEach(movies, id: \.path) { movie in
+                Button(role: .destructive) {
+                    removeVideos([movie.path])
+                } label: {
+                    if others.contains(movie.path) {
+                        Text("\(movie.name) (the other camera’s)")
+                    } else {
+                        Text(verbatim: movie.name)
+                    }
+                }
+                .disabled(others.contains(movie.path))
+            }
+            if !unused.isEmpty {
+                Divider()
+                Button("Remove all videos no camera shows", role: .destructive) {
+                    removeVideos(Set(unused.map(\.path)))
+                }
+            }
+        } label: {
+            Label("Remove video", systemImage: "trash")
+        }
+        .fixedSize()
+        .disabled(movies.isEmpty || processingVideo)
+    }
+
+    private func removeVideos(_ paths: Set<String>) {
+        if let path = selection.videoFilePath, paths.contains(path) { selection = .emulated }
+        // Their framing goes with them.
+        let kept = framing.filter { !paths.contains($0.key) }
+        if kept.count != framing.count { framing = kept }
+        Task {
+            await Task.detached(priority: .userInitiated) { CameraVideos.remove(paths: paths) }.value
+            NotificationCenter.default.post(name: CameraVideos.changed, object: nil)
         }
     }
 

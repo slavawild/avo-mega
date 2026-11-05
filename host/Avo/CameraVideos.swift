@@ -9,7 +9,7 @@ import Foundation
 ///
 /// The menu lists them all, so a movie can be chosen again without copying
 /// it again. Past the `kept` newest, those no camera shows go at the next
-/// import.
+/// import; Remove video lets any go now.
 enum CameraVideos {
     /// One imported movie.
     struct Movie: Hashable, Sendable {
@@ -20,6 +20,10 @@ enum CameraVideos {
         /// own carry a UUID instead).
         var name: String { URL(fileURLWithPath: path).lastPathComponent }
     }
+
+    /// Posted (on the main thread) when movies were imported or removed:
+    /// every camera picker lists them again.
+    static let changed = Notification.Name("com.avodroid.cameraVideosChanged")
 
     /// Movies kept besides the ones a camera shows.
     static let kept = 5
@@ -92,6 +96,12 @@ enum CameraVideos {
     static func prune(keeping inUse: Set<String>) {
         let unused = imported().filter { !inUse.contains($0.path) }
         for movie in unused.dropFirst(kept) { remove(movie) }
+    }
+
+    /// Removes `paths`' movies and their sidecars (Remove video in the
+    /// camera picker); the camera that showed one is the picker's to change.
+    static func remove(paths: Set<String>) {
+        for movie in imported() where paths.contains(movie.path) { remove(movie) }
     }
 
     private static func remove(_ movie: Movie) {
