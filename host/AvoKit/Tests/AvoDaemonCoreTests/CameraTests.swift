@@ -6,6 +6,7 @@ import CryptoKit
 import Foundation
 import ImageIO
 import Testing
+import UniformTypeIdentifiers
 @testable import AvoDaemonCore
 
 @Suite struct CameraSettingsTests {
@@ -53,6 +54,20 @@ import Testing
             #expect(other.videoMicrophonePCMPath == nil)
             #expect(VMMEngine.videoMicrophoneCommand(other) == "microphone mac")
         }
+    }
+
+    /// Pictures are told from movies by their kind; a picture has no sound
+    /// for the microphone, so the other camera's movie is heard.
+    @Test func picturesAreToldFromMovies() {
+        #expect(CameraSource.isPicture("/V/1/photo.JPG") && CameraSource.isPicture("/V/2/shot.heic") && CameraSource.isPicture("/V/3/a b.png"))
+        #expect(!CameraSource.isPicture("/V/4/clip.mov") && !CameraSource.isPicture("/V/5/clip.mp4"))
+        #expect(CameraSource.video("/V/1/photo.jpg").movieFilePath == nil)
+        #expect(CameraSource.video("/V/5/clip.mp4").movieFilePath == "/V/5/clip.mp4")
+        let config = VMConfig(backCamera: .video("/V/5/clip.mp4"), frontCamera: .video("/V/1/photo.jpg"), microphoneVideoAudio: true)
+        #expect(config.soundtrackCamera == 0)
+        #expect(config.videoMicrophonePCMPath == "/V/5/clip.pcm")
+        #expect(VMMEngine.soundtrackSyncCommand(12.5) == "microphone sync 12.500")
+        #expect(VMMEngine.soundtrackSyncCommand(-3) == "microphone sync 0.000")
     }
 
     @Test func sourcesAreSavedAsWords() throws {
@@ -396,6 +411,75 @@ import Testing
         #expect(runs.count >= 3, "the movie started over: \(runs)")
     }
 
+    /// A video camera starts where it is told, and moves when asked: the
+    /// movie is red for its first half second, blue for the second half.
+    @Test func aVideoCameraStartsAndMovesWhereAsked() async throws {
+        let url = FileManager.default.temporaryDirectory.appending(path: "avo-cam-\(UUID().uuidString.prefix(8)).mov")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try await Self.writeMovie(url, colors: Array(repeating: (255, 0, 0), count: 5) + Array(repeating: (0, 0, 255), count: 5), fps: 10)
+        final class Frames: @unchecked Sendable {
+            let lock = NSLock()
+            var all: [Data] = []
+        }
+        let frames = Frames()
+        let camera = FileVideoCamera(path: url.path, request: .init(width: 32, height: 24, fps: 20), deliver: { jpeg in
+            frames.lock.withLock { frames.all.append(jpeg) }
+        }, startAt: 0.7)
+        #expect(camera.playback().position == 0.7, "where it will start, before it loads")
+        camera.start()
+        func colors() -> [String] {
+            frames.lock.withLock { frames.all }.compactMap { jpeg in
+                centerColor(jpeg).map { $0.red > 150 && $0.blue < 100 ? "red" : $0.blue > 150 && $0.red < 100 ? "blue" : "other" }
+            }
+        }
+        for _ in 0..<100 where colors().isEmpty { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(colors().first == "blue", "it starts in the movie's second half: \(colors())")
+        let moved = camera.seek(to: 0.1)
+        #expect(moved.position == 0.1 && moved.playing)
+        #expect(abs((moved.duration ?? 0) - 1) < 0.01, "\(String(describing: moved.duration))")
+        frames.lock.withLock { frames.all = [] }
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(colors().contains("red"), "moved into the first half: \(colors())")
+        #expect(camera.seek(to: 50).position < 1, "no further than its end")
+        camera.stop()
+    }
+
+    /// A picture camera sends its picture at Android's size, framed, and
+    /// the same JPEG every frame until the framing changes.
+    @Test func aPictureCameraShowsItsPictureStill() async throws {
+        let url = FileManager.default.temporaryDirectory.appending(path: "avo-pic-\(UUID().uuidString.prefix(8)).png")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let context = try #require(CGContext(data: nil, width: 200, height: 100, bitsPerComponent: 8, bytesPerRow: 0,
+                                             space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: 200, height: 100))
+        let destination = try #require(CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, try #require(context.makeImage()), nil)
+        #expect(CGImageDestinationFinalize(destination))
+        final class Frames: @unchecked Sendable {
+            let lock = NSLock()
+            var all: [Data] = []
+            var framing = VideoFraming()
+        }
+        let frames = Frames()
+        let camera = PictureCamera(path: url.path, request: .init(width: 32, height: 24, fps: 20), deliver: { jpeg in
+            frames.lock.withLock { frames.all.append(jpeg) }
+        }, framing: { frames.lock.withLock { frames.framing } })
+        camera.start()
+        try await Task.sleep(for: .milliseconds(500))
+        let still = frames.lock.withLock { frames.all }
+        #expect(still.count >= 4, "frames keep coming: \(still.count)")
+        #expect(Set(still).count == 1, "the same JPEG every frame")
+        #expect(still.first.flatMap(size).map { $0 == (32, 24) } ?? false)
+        #expect(still.first.flatMap(centerColor).map { $0.red > 150 && $0.blue < 100 } ?? false)
+        // Zoomed out on black: a new JPEG.
+        frames.lock.withLock { frames.framing = VideoFraming(mode: .fit, zoom: 0.5) }
+        try await Task.sleep(for: .milliseconds(300))
+        camera.stop()
+        #expect(Set(frames.lock.withLock { frames.all }).count == 2)
+    }
+
     /// One frame of each color, at `fps`, as Motion JPEG (no hardware encoder needed).
     private static func writeMovie(_ url: URL, colors: [(UInt8, UInt8, UInt8)], fps: Int32, width: Int = 64, height: Int = 48) async throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
@@ -469,7 +553,7 @@ import Testing
         }
         let starts = Starts()
         let path = FileManager.default.temporaryDirectory.appending(path: "avo-cam-\(UUID().uuidString.prefix(8)).sock").path
-        let feed = CameraFeed(socketPath: path, sources: [.none, .video("/nonexistent/a.mp4")]) { camera in
+        let feed = CameraFeed(socketPath: path, sources: [.none, .video("/nonexistent/a.mp4")]) { camera, _ in
             starts.lock.withLock { starts.cameras.append(camera) }
         }
         feed.handle("camera 1 on 320 240 15")

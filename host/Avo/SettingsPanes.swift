@@ -595,16 +595,16 @@ struct SystemPane: View {
                 if config.camerasEnabled {
                     let videos = Set([config.backCamera, config.frontCamera].compactMap(\.videoFilePath))
                     let framing = Binding(get: { config.cameraVideoFraming }, set: { value in model.update { $0.cameraVideoFraming = value } })
-                    CameraPicker(title: "Back camera", videosInUse: videos, otherVideo: config.frontCamera.videoFilePath, framing: framing,
+                    CameraPicker(title: "Back camera", camera: 0, videosInUse: videos, otherVideo: config.frontCamera.videoFilePath, framing: framing,
                                  selection: Binding(get: { config.backCamera }, set: { value in model.update { $0.backCamera = value } }))
-                    CameraPicker(title: "Front camera", videosInUse: videos, otherVideo: config.backCamera.videoFilePath, framing: framing,
+                    CameraPicker(title: "Front camera", camera: 1, videosInUse: videos, otherVideo: config.backCamera.videoFilePath, framing: framing,
                                  selection: Binding(get: { config.frontCamera }, set: { value in model.update { $0.frontCamera = value } }))
                 }
                 RestartNote(text: "Turning cameras on or off, or giving Android a Mac camera, a video or no camera, applies when Android restarts; switching between cameras after that applies at once.")
             } header: {
                 HelpTitle("Cameras") {
                     Text("Emulated shows a picture drawn for the camera, with no camera needed. One of this Mac’s cameras shows what it sees while an Android app uses it (its light is on only then). macOS asks for permission the first time.")
-                    Text("A video shows one of your movies, over and over, as if the camera saw it. Avo keeps a copy of it, and of the last few you chose, so it stays in the menu.")
+                    Text("A video shows one of your movies, over and over, as if the camera saw it; while an app uses the camera, the slider under it moves it to any moment. A picture shows one of your photos, still. Avo keeps a copy of it, and of the last few you chose, so it stays in the menu.")
                     Text("Android apps find the back camera and the front one as on a phone. The Mac’s camera is not mirrored; apps mirror their own preview of the front one.")
                     Text("Off, Android has no camera, and Avo never uses the Mac’s.")
                 }
@@ -623,7 +623,7 @@ struct SystemPane: View {
                     }
                 }
                 if config.microphoneEnabled {
-                    let hasVideo = config.cameraSources.contains { $0.videoFilePath != nil }
+                    let hasVideo = config.cameraSources.contains { $0.movieFilePath != nil }
                     Toggle("Use a camera video’s sound", isOn: Binding(
                         get: { config.microphoneVideoAudio },
                         set: { value in model.update { $0.microphoneVideoAudio = value } }
@@ -1108,6 +1108,8 @@ struct CopyButton: View {
 /// default camera).
 struct CameraPicker: View {
     let title: LocalizedStringKey
+    /// As avo-vmm numbers them: 0 back, 1 front.
+    let camera: Int
     /// The videos both cameras show, kept when old copies go.
     let videosInUse: Set<String>
     /// The video the other camera shows: not to be removed from here.
@@ -1137,7 +1139,7 @@ struct CameraPicker: View {
                         HazeOption("Not connected", selection)
                     }
                 }
-                HazeSection("Videos") {
+                HazeSection("Videos and pictures") {
                     for movie in movies { HazeOption(verbatim: movie.name, CameraSource.video(movie.path)) }
                     if lookedForMovies, let path = selection.videoFilePath, !movies.contains(where: { $0.path == path }) {
                         HazeOption("Not found", selection)
@@ -1161,11 +1163,11 @@ struct CameraPicker: View {
             Task { await lookForCameras() }
         }
         HStack(spacing: 12) {
-            Button("Choose video file…") { importingVideo = true }
+            Button("Choose video or picture…") { importingVideo = true }
                 .disabled(processingVideo)
             removeVideoMenu
         }
-            .fileImporter(isPresented: $importingVideo, allowedContentTypes: [.mpeg4Movie, .movie]) { result in
+            .fileImporter(isPresented: $importingVideo, allowedContentTypes: [.mpeg4Movie, .movie, .image]) { result in
                 let url: URL
                 do {
                     url = try result.get()
@@ -1199,10 +1201,13 @@ struct CameraPicker: View {
                 }
             }
         if let path = selection.videoFilePath {
+            if !CameraSource.isPicture(path) {
+                VideoPlaybackControls(camera: camera, path: path)
+            }
             VideoFramingControls(framing: Binding(get: { framing[path] ?? VideoFraming() }, set: { framing[path] = $0 }))
         }
         if processingVideo {
-            Text("Copying the video and its sound…")
+            Text("Copying the file…")
                 .font(.mona(12))
                 .foregroundStyle(Haze.textTertiary)
                 .hazeRowNote()
@@ -1273,6 +1278,88 @@ struct CameraPicker: View {
         AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera, .external, .continuityCamera],
                                          mediaType: .video, position: .unspecified)
             .devices.map { ($0.uniqueID, $0.localizedName) }
+    }
+}
+
+/// Where the movie a camera shows has got to, and a slider that moves it
+/// (CameraVideoPlayback): followed twice a second while the row shows.
+/// While no app uses the camera, a moved movie starts there the next time.
+struct VideoPlaybackControls: View {
+    @Environment(ControlPanelModel.self) private var model
+    let camera: Int
+    let path: String
+    @State private var playback: CameraVideoPlayback?
+    /// The movie's length, read here: the daemon knows it only while it plays.
+    @State private var length: Double?
+    /// Where the slider is while it is held.
+    @State private var draft: Double?
+
+    var body: some View {
+        let duration = playback?.duration ?? length ?? 0
+        HStack(spacing: 10) {
+            Button {
+                Task { await seek(0) }
+            } label: {
+                Image(systemName: "backward.end.fill")
+            }
+            .buttonStyle(.borderless)
+            .help(Text("From the beginning"))
+            HazeSlider(value: Binding(get: { draft ?? playback?.position ?? 0 }, set: { value in
+                // Dragged: on release. Moved a step (VoiceOver): at once.
+                if draft != nil { draft = value } else { Task { await seek(value) } }
+            }), range: 0...max(duration, 0.1), step: 0.1) { editing in
+                if editing {
+                    draft = playback?.position ?? 0
+                } else if let draft {
+                    self.draft = nil
+                    Task { await seek(draft) }
+                }
+            }
+            .accessibilityLabel(Text("Where the video is"))
+            Text(verbatim: "\(Self.time(draft ?? playback?.position ?? 0)) / \(Self.time(duration))")
+                .font(.mona(12))
+                .foregroundStyle(Haze.textTertiary)
+                .monospacedDigit()
+        }
+        .disabled(playback == nil || duration <= 0)
+        .task(id: path) {
+            length = await Self.length(of: path)
+        }
+        .task(id: "\(camera) \(path) \(model.status.state)") {
+            while !Task.isCancelled {
+                if draft == nil { playback = await model.cameraVideoPlayback(camera: camera) }
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+        }
+        note
+            .font(.mona(12))
+            .foregroundStyle(Haze.textTertiary)
+            .hazeRowNote()
+    }
+
+    private var note: Text {
+        if model.status.state != .running {
+            Text("The slider moves the video while Android is running.")
+        } else if playback?.playing == false {
+            Text("The video plays while an app uses this camera; moved here, it starts from that moment.")
+        } else {
+            Text("Drag to move the video to any moment; its sound, as the microphone, goes with it.")
+        }
+    }
+
+    private func seek(_ seconds: Double) async {
+        if let moved = await model.cameraVideoPlayback(camera: camera, seekTo: seconds) { playback = moved }
+    }
+
+    /// "1:05" for 65 seconds.
+    static func time(_ seconds: Double) -> String {
+        let whole = Int(seconds.isFinite ? max(0, seconds) : 0)
+        return String(format: "%d:%02d", whole / 60, whole % 60)
+    }
+
+    private static func length(of path: String) async -> Double? {
+        guard let duration = try? await AVURLAsset(url: URL(fileURLWithPath: path)).load(.duration), duration.isNumeric else { return nil }
+        return duration.seconds
     }
 }
 

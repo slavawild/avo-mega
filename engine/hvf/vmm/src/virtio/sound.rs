@@ -267,6 +267,15 @@ impl PCMVideoMic {
          i16::from_le_bytes([bytes[offset + 2], bytes[offset + 3]]))
     }
 
+    /// Its frame `seconds` into it, wrapping past its end.
+    fn at(&self, seconds: f64) -> f64 {
+        let frames = (self.bytes / 4) as f64;
+        if frames == 0.0 || !seconds.is_finite() || seconds <= 0.0 {
+            return 0.0;
+        }
+        (seconds * f64::from(SOUNDTRACK_RATE)) % frames
+    }
+
     fn render(&mut self, params: Params, count: usize) -> Vec<u8> {
         let source = unsafe { std::slice::from_raw_parts(self.data.cast::<u8>(), self.bytes) };
         resample(source, &mut self.position, &mut self.filter, params.rate, params.channels, count)
@@ -420,15 +429,16 @@ impl Microphone {
 
     fn file_path(&self) -> Option<String> { self.file.lock().unwrap().clone() }
 
-    /// Restart the active file soundtrack when Android starts its camera.
-    /// The video producer starts on the same event, keeping both near the
-    /// same playback offset even if microphone recording began earlier.
-    pub fn sync_video(&self) {
+    /// Puts the active file soundtrack at `seconds` into its video (0 when
+    /// Android starts its camera, where the video starts; elsewhere when the
+    /// video is moved there), keeping both at the same moment even if
+    /// recording began earlier. Past its end it wraps, as the video loops.
+    pub fn sync_video(&self, seconds: f64) {
         let mut devices = self.devices.lock().unwrap();
         devices.retain(|device| device.strong_count() > 0);
         for state in devices.iter().filter_map(Weak::upgrade) {
             if let Some(soundtrack) = state.lock().unwrap().streams[CAPTURE].video_audio.as_mut() {
-                soundtrack.position = 0.0;
+                soundtrack.position = soundtrack.at(seconds);
             }
         }
     }
@@ -1515,6 +1525,20 @@ mod tests {
         for value in lefts(&resample(&source, &mut position, &mut filter, 11_025, 2, 2_000 * 4), 2) {
             assert_eq!(value, 1_234.0);
         }
+    }
+
+    #[test]
+    fn a_soundtrack_goes_to_its_video_s_second_and_wraps() {
+        let path = std::env::temp_dir().join(format!("avo-soundtrack-{}.pcm", std::process::id()));
+        // Two seconds of 48 kHz stereo.
+        std::fs::write(&path, vec![0u8; 2 * 48_000 * 4]).unwrap();
+        let soundtrack = PCMVideoMic::open(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(soundtrack.at(1.5), 72_000.0);
+        assert_eq!(soundtrack.at(2.5), 24_000.0, "past its end it wraps, as the video loops");
+        assert_eq!(soundtrack.at(0.0), 0.0);
+        assert_eq!(soundtrack.at(-1.0), 0.0);
+        assert_eq!(soundtrack.at(f64::NAN), 0.0);
     }
 
     #[test]

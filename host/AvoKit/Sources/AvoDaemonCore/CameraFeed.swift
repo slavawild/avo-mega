@@ -85,18 +85,21 @@ public final class CameraFeed: @unchecked Sendable {
     /// Frames waiting for `output`: past a few, new ones are dropped.
     private let lock = NSLock()
     private var backlog = 0
-    /// A video source's movie started again from its beginning on this
-    /// camera (Android began streaming it, asked for a new size, or chose
-    /// the video while it streams), so its soundtrack can start over too.
-    /// On `state`.
-    private let videoStarted: (@Sendable (Int) -> Void)?
+    /// A video source's movie started on this camera (Android began
+    /// streaming it, asked for a new size, or chose the video while it
+    /// streams: from its beginning, or where `videoPlayback` put it) or
+    /// was moved to another second: its soundtrack goes there too.
+    private let videoStarted: (@Sendable (_ camera: Int, _ seconds: Double) -> Void)?
+    /// Where a camera's movie starts the next time it plays, when it was
+    /// moved while no app used the camera. On `state`.
+    private var startAt: [Int: Double] = [:]
     /// How each video fills the picture (VMConfig.cameraVideoFraming): read
     /// by a playing video at every frame, so a change shows at once.
     private let framingLock = NSLock()
     private var framing: [String: VideoFraming]
 
     public init(socketPath: String, sources: [CameraSource], framing: [String: VideoFraming] = [:],
-                videoStarted: (@Sendable (Int) -> Void)? = nil) {
+                videoStarted: (@Sendable (_ camera: Int, _ seconds: Double) -> Void)? = nil) {
         self.socketPath = socketPath
         self.sources = sources
         self.framing = framing
@@ -142,6 +145,7 @@ public final class CameraFeed: @unchecked Sendable {
             let old = self.sources
             self.sources = sources
             for camera in sources.indices where camera >= old.count || old[camera] != sources[camera] {
+                startAt[camera] = nil
                 restart(camera)
             }
         }
@@ -174,15 +178,37 @@ public final class CameraFeed: @unchecked Sendable {
             producer = DrawnCamera(.scene(camera: camera), request: request, deliver: deliver)
         case .mac(let id):
             producer = macCamera(id, camera: camera, request: request, deliver: deliver)
+        case .video(let path) where CameraSource.isPicture(path):
+            producer = PictureCamera(path: path, request: request, deliver: deliver) { [weak self] in
+                self?.framing(of: path) ?? VideoFraming()
+            }
         case .video(let path):
-            producer = FileVideoCamera(path: path, request: request, deliver: deliver) { [weak self] in
+            producer = FileVideoCamera(path: path, request: request, deliver: deliver, startAt: startAt.removeValue(forKey: camera) ?? 0) { [weak self] in
                 self?.framing(of: path) ?? VideoFraming()
             }
         }
         logger.notice("camera \(camera, privacy: .public): \(request.width)×\(request.height) at \(request.fps) fps from \(self.sources[camera].rawValue, privacy: .public)")
         producers[camera] = producer
         producer?.start()
-        if producer is FileVideoCamera { videoStarted?(camera) }
+        if let video = producer as? FileVideoCamera { videoStarted?(camera, video.startAt) }
+    }
+
+    /// Where camera `camera`'s movie is, after moving it to `seconds` into
+    /// it when given (Settings › Devices › Cameras); nil when the camera
+    /// shows no movie. While no app uses the camera, the movie starts
+    /// there the next time it plays.
+    public func videoPlayback(camera: Int, seekTo seconds: Double?) -> CameraVideoPlayback? {
+        let (playback, moved) = state.sync { () -> (CameraVideoPlayback?, Bool) in
+            guard camera >= 0, camera < sources.count, sources[camera].movieFilePath != nil else { return (nil, false) }
+            if let video = producers[camera] as? FileVideoCamera {
+                if let seconds { return (video.seek(to: seconds), true) }
+                return (video.playback(), false)
+            }
+            if let seconds, seconds.isFinite { startAt[camera] = max(0, seconds) }
+            return (CameraVideoPlayback(playing: false, position: startAt[camera] ?? 0, duration: nil), false)
+        }
+        if moved, let playback { videoStarted?(camera, playback.position) }
+        return playback
     }
 
     /// On `state`: the Mac's camera `id` (or its default one when that is
@@ -480,12 +506,53 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
     /// How the movie fills the picture now (CameraFeed.useFraming).
     private let framing: @Sendable () -> VideoFraming
 
-    init(path: String, request: CameraFeed.Request, deliver: @escaping @Sendable (Data) -> Void,
+    /// Seconds into the movie it starts at (wrapping past its end).
+    let startAt: Double
+    /// Where a move asked for before the movie loaded starts it instead.
+    private var pendingStart: Double?
+
+    init(path: String, request: CameraFeed.Request, deliver: @escaping @Sendable (Data) -> Void, startAt: Double = 0,
          framing: @escaping @Sendable () -> VideoFraming = { VideoFraming() }) {
         self.asset = AVURLAsset(url: URL(fileURLWithPath: path))
         self.request = request
         self.deliver = deliver
+        self.startAt = startAt.isFinite ? max(0, startAt) : 0
         self.framing = framing
+    }
+
+    /// Where the movie is now (not on `queue`).
+    func playback() -> CameraVideoPlayback {
+        queue.sync {
+            guard let movie, let loopStart else {
+                return CameraVideoPlayback(playing: true, position: pendingStart ?? startAt, duration: nil)
+            }
+            return CameraVideoPlayback(playing: true, position: position(since: loopStart, in: movie), duration: movie.duration)
+        }
+    }
+
+    /// Moves the movie to `seconds` into it (within it), and says where it
+    /// is now (not on `queue`). Its next frame is from there.
+    func seek(to seconds: Double) -> CameraVideoPlayback {
+        queue.sync {
+            let wanted = seconds.isFinite ? max(0, seconds) : 0
+            guard let movie, !stopped else {
+                pendingStart = wanted
+                return CameraVideoPlayback(playing: true, position: wanted, duration: nil)
+            }
+            let start = min(wanted, max(0, movie.duration - 0.001))
+            loopStart = clock.now.advanced(by: .seconds(-start))
+            rewind(at: start)
+            // The frame up now is from elsewhere in the movie: the next one decoded replaces it.
+            lastFraming = nil
+            return CameraVideoPlayback(playing: true, position: start, duration: movie.duration)
+        }
+    }
+
+    /// Seconds into the movie at this moment, the loop started at `loopStart`.
+    private func position(since loopStart: ContinuousClock.Instant, in movie: Movie) -> Double {
+        let elapsed = loopStart.duration(to: clock.now)
+        let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+        return movie.duration > 0 ? max(0, seconds.truncatingRemainder(dividingBy: movie.duration)) : 0
     }
 
     func start() {
@@ -518,12 +585,15 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
         }
     }
 
-    /// On `queue`: the movie is loaded; it plays from its beginning now.
+    /// On `queue`: the movie is loaded; it plays from `startAt` (or where
+    /// it was moved meanwhile) now.
     private func begin(_ movie: Movie) {
         guard !stopped else { return }
         self.movie = movie
-        loopStart = clock.now
-        rewind()
+        let start = (pendingStart ?? startAt).truncatingRemainder(dividingBy: movie.duration)
+        pendingStart = nil
+        loopStart = clock.now.advanced(by: .seconds(-start))
+        rewind(at: start)
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / max(request.fps, 1)), leeway: .milliseconds(3))
         timer.setEventHandler { [weak self] in self?.tick() }
@@ -718,6 +788,83 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
         case (-1, 0, 0, -1): .down
         default: .up
         }
+    }
+}
+
+/// An imported picture (CameraSource.isPicture), shown still at Android's
+/// rate. It is read once, upright as its EXIF orientation says and no
+/// larger than the closest zoom needs, and framed and encoded again only
+/// when its framing changes: every other frame is the same JPEG.
+final class PictureCamera: CameraProducer, @unchecked Sendable {
+    private let url: URL
+    private let request: CameraFeed.Request
+    private let deliver: @Sendable (Data) -> Void
+    /// How the picture fills Android's (CameraFeed.useFraming).
+    private let framing: @Sendable () -> VideoFraming
+    private let encoder = JPEGEncoder()
+    /// Everything below changes on `queue` only.
+    private let queue = DispatchQueue(label: "com.avodroid.cameras.picture")
+    private var timer: DispatchSourceTimer?
+    private var picture: CIImage?
+    private var last: Data?
+    private var lastFraming: VideoFraming?
+    private var stopped = false
+
+    init(path: String, request: CameraFeed.Request, deliver: @escaping @Sendable (Data) -> Void,
+         framing: @escaping @Sendable () -> VideoFraming = { VideoFraming() }) {
+        self.url = URL(fileURLWithPath: path)
+        self.request = request
+        self.deliver = deliver
+        self.framing = framing
+    }
+
+    func start() {
+        queue.async { [self] in
+            guard !stopped else { return }
+            // Missing or unreadable: nothing is sent, and the VM keeps its gray.
+            let longest = max(request.width, request.height) * Int(VideoFraming.zoomRange.upperBound.rounded(.up))
+            guard let picture = Self.load(url, longestSide: longest) else { return }
+            self.picture = picture
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / max(request.fps, 1)), leeway: .milliseconds(3))
+            timer.setEventHandler { [weak self] in self?.tick() }
+            self.timer = timer
+            timer.resume()
+        }
+    }
+
+    func stop() {
+        queue.sync {
+            stopped = true
+            timer?.cancel()
+            timer = nil
+        }
+    }
+
+    /// On `queue`, once per frame Android wants.
+    private func tick() {
+        guard !stopped, let picture else { return }
+        let framing = self.framing()
+        if last == nil || framing != lastFraming {
+            let turned = JPEGEncoder.turned(picture, quarterTurns: framing.quarterTurns)
+            last = encoder.jpeg(JPEGEncoder.sensorFrame(turned, width: request.width, height: request.height, framing: framing))
+            lastFraming = framing
+        }
+        if let last { deliver(last) }
+    }
+
+    /// The picture at `url`, upright, its longest side at most `longestSide`
+    /// (a 48-megapixel photo is not kept whole for a 720p camera).
+    static func load(_ url: URL, longestSide: Int) -> CIImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(16, longestSide),
+            kCGImageSourceShouldCacheImmediately: true,
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        return CIImage(cgImage: image)
     }
 }
 

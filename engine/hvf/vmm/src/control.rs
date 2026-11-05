@@ -33,7 +33,8 @@
 //!                                     (virtio/sound.rs; off, records silence)
 //! microphone mac|file <path>          use the Mac microphone or an imported
 //!                                     48 kHz stereo S16LE PCM soundtrack
-//! microphone sync                     restart file audio when video camera starts
+//! microphone sync [seconds]           start file audio over (or at that second of
+//!                                     the video) with the video camera
 //! tap <x> <y> / swipe <x1> <y1> <x2> <y2> [ms]   pixels of scanout 0 (debugging)
 //! pause                              stop the vCPUs (pause.rs); `ok` once none
 //!                                     runs guest code, an error when one does
@@ -179,20 +180,27 @@ enum Microphone {
     /// `file <path>`: an imported video's soundtrack sidecar (48 kHz stereo
     /// S16LE), by its absolute path, spaces and all.
     File(String),
-    /// `sync`: the video camera started its movie over; so does its soundtrack.
-    Sync,
+    /// `sync [seconds]`: the video camera started its movie over, or
+    /// jumped to that second of it; so does its soundtrack.
+    Sync(f64),
 }
 
 fn parse_microphone(line: &str) -> Result<Microphone, String> {
-    let usage = || "microphone on|off|mac|sync|file <path>".to_string();
+    let usage = || "microphone on|off|mac|sync [seconds]|file <path>".to_string();
     let rest = line.trim().strip_prefix("microphone").ok_or_else(usage)?.trim_start();
     let (word, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     match word {
-        "on" | "off" | "mac" | "sync" if !after.trim().is_empty() => Err(usage()),
+        "on" | "off" | "mac" if !after.trim().is_empty() => Err(usage()),
         "on" => Ok(Microphone::Allowed(true)),
         "off" => Ok(Microphone::Allowed(false)),
         "mac" => Ok(Microphone::Mac),
-        "sync" => Ok(Microphone::Sync),
+        "sync" => match after.trim() {
+            "" => Ok(Microphone::Sync(0.0)),
+            seconds => match seconds.parse::<f64>() {
+                Ok(seconds) if seconds.is_finite() && seconds >= 0.0 => Ok(Microphone::Sync(seconds)),
+                _ => Err(usage()),
+            },
+        },
         "file" => {
             // The rest of the line is the path: a file's name may hold spaces.
             let path = after.trim();
@@ -436,7 +444,7 @@ impl Controls {
                 match parse_microphone(line)? {
                     Microphone::Allowed(allowed) => MICROPHONE.set(allowed),
                     Microphone::Mac => MICROPHONE.set_file(None),
-                    Microphone::Sync => MICROPHONE.sync_video(),
+                    Microphone::Sync(seconds) => MICROPHONE.sync_video(seconds),
                     Microphone::File(path) => MICROPHONE.set_file(Some(path)),
                 }
             }
@@ -578,13 +586,15 @@ mod tests {
         assert_eq!(parse_microphone("microphone on"), Ok(Microphone::Allowed(true)));
         assert_eq!(parse_microphone("microphone off"), Ok(Microphone::Allowed(false)));
         assert_eq!(parse_microphone("microphone mac"), Ok(Microphone::Mac));
-        assert_eq!(parse_microphone("microphone sync"), Ok(Microphone::Sync));
+        assert_eq!(parse_microphone("microphone sync"), Ok(Microphone::Sync(0.0)));
+        assert_eq!(parse_microphone("microphone sync 12.5"), Ok(Microphone::Sync(12.5)));
         // A path keeps its spaces, wherever the command's own spaces fall.
         let path = "/Users/a b/Library/Application Support/Avo/CameraVideos/1/My  clip.pcm";
         assert_eq!(parse_microphone(&format!("microphone file {path}")), Ok(Microphone::File(path.into())));
         assert_eq!(parse_microphone(&format!("  microphone   file   {path}  ")), Ok(Microphone::File(path.into())));
         for line in ["microphone", "microphone file", "microphone file clip.pcm", "microphone file /a/clip.mp4", "microphone file /.pcm",
-                     "microphone on now", "microphone loud", "microphones on"] {
+                     "microphone on now", "microphone loud", "microphones on", "microphone sync -1", "microphone sync soon",
+                     "microphone sync 1 2", "microphone sync inf"] {
             assert!(parse_microphone(line).is_err(), "{line}");
         }
     }

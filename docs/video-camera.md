@@ -72,3 +72,11 @@ Video FPS follows the Android camera stream request. The movie is decoded in ord
 - `make build` (it applies `scripts/avo-kit-patches` to `vendor/avo_kit` first)
 - In Android, test both camera facings using a Camera2 app, repeat past EOF, switch back to emulated, and verify normal Mac webcam behavior.
 - In a portrait app: a portrait phone video fills the preview upright, a taken photo opens upright in Photos; in a landscape window the preview stays upright. Check a CameraX app and a legacy Camera API app (both honour the sensor orientation).
+
+## Pictures
+
+A picture (JPEG, PNG, HEIC, anything ImageIO reads) is imported like a movie, into the same list, and shows still: `PictureCamera` reads it once, upright as its EXIF orientation says and no larger than three times the camera's longest side (the closest zoom), and frames and encodes it again only when its framing changes; every other frame is the same JPEG. It has no soundtrack: with the microphone set to a camera video's sound, the other camera's movie is heard, or silence.
+
+## Moving the video
+
+Under a camera's movie, Settings › Devices › Cameras has a slider: where the movie is (followed twice a second) and, dragged, where it goes (`DaemonClient.cameraVideoPlayback`, XPC `cameraVideoPlayback`). `FileVideoCamera.seek` starts a new reader there and moves its loop's start; its soundtrack, when it is the microphone, goes to the same second (`microphone sync <seconds>`). While no app uses the camera, a moved movie starts there the next time it plays.

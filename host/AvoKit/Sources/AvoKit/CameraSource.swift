@@ -1,4 +1,5 @@
 import Foundation
+import UniformTypeIdentifiers
 
 /// What one of Android's cameras shows (Settings › Devices › Cameras).
 ///
@@ -12,8 +13,10 @@ public enum CameraSource: Hashable, Sendable {
     case emulated
     /// One of this Mac's cameras (`AVCaptureDevice.uniqueID`).
     case mac(String)
-    /// A local MP4/MOV copied into Avo's Application Support folder.
-    /// The daemon decodes it only while Android streams the camera.
+    /// A local movie (MP4, MOV) or picture (JPEG, PNG, HEIC…) copied into
+    /// Avo's Application Support folder (`isPicture` tells which). The
+    /// daemon decodes it only while Android streams the camera: a movie
+    /// plays over and over, a picture stays.
     case video(String)
     /// None: Android does not have this camera.
     case none
@@ -21,6 +24,18 @@ public enum CameraSource: Hashable, Sendable {
     public var videoFilePath: String? {
         if case .video(let path) = self { return path }
         return nil
+    }
+
+    /// Whether an imported file is a picture (shown still, without sound)
+    /// rather than a movie, by its kind.
+    public static func isPicture(_ path: String) -> Bool {
+        let type = UTType(filenameExtension: URL(fileURLWithPath: path).pathExtension)
+        return type?.conforms(to: .image) == true && type?.conforms(to: .movie) != true
+    }
+
+    /// An imported movie (not a picture) this camera shows.
+    public var movieFilePath: String? {
+        videoFilePath.flatMap { Self.isPicture($0) ? nil : $0 }
     }
 
     /// The 48 kHz stereo S16LE sidecar beside an imported video: its
@@ -138,13 +153,13 @@ extension CameraSource: Codable {
 extension VMConfig {
     /// The camera (as avo-vmm numbers them: 0 back, 1 front) whose video's
     /// soundtrack Android's microphone hears: with the microphone on and set
-    /// to a video's soundtrack, the front camera's video first (calls use
-    /// it), else the back one's. Nil otherwise: the Mac's microphone, or
-    /// silence with the microphone off.
+    /// to a video's soundtrack, the front camera's movie first (calls use
+    /// it), else the back one's; a picture has no sound. Nil otherwise: the
+    /// Mac's microphone, or silence with the microphone off.
     public var soundtrackCamera: Int? {
         guard microphoneEnabled, microphoneVideoAudio else { return nil }
         let sources = cameraSources
-        return [1, 0].first { sources[$0].videoFilePath != nil }
+        return [1, 0].first { sources[$0].movieFilePath != nil }
     }
 
     /// `soundtrackCamera`'s video's soundtrack sidecar (made when the Control
@@ -164,5 +179,34 @@ extension VMConfig {
         if sources == [.emulated, .emulated] { return [] }
         let present = zip(["back", "front"], sources).filter { $0.1 != .none }.map(\.0)
         return ["--cameras", present.isEmpty ? "none" : present.joined(separator: ",")]
+    }
+}
+
+/// Where the movie a camera shows has got to (Settings › Devices ›
+/// Cameras, DaemonClient.cameraVideoPlayback): `position` seconds into
+/// its `duration`. Not `playing` while no Android app uses the camera:
+/// `position` is then where it starts the next time.
+public struct CameraVideoPlayback: Codable, Hashable, Sendable {
+    public var playing: Bool
+    public var position: Double
+    /// Nil until the movie has loaded (only while it plays).
+    public var duration: Double?
+
+    public init(playing: Bool, position: Double, duration: Double?) {
+        self.playing = playing
+        self.position = position
+        self.duration = duration
+    }
+}
+
+/// A request for `CameraVideoPlayback`: camera 0 (back) or 1 (front), and
+/// the second of its movie to go to, or nil to ask only.
+public struct CameraVideoSeek: Codable, Hashable, Sendable {
+    public var camera: Int
+    public var seconds: Double?
+
+    public init(camera: Int, seconds: Double?) {
+        self.camera = camera
+        self.seconds = seconds
     }
 }

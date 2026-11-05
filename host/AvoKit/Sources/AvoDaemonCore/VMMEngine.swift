@@ -169,6 +169,11 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
         return arguments
     }
 
+    /// `microphone sync <seconds>`: the soundtrack to that second of its movie.
+    static func soundtrackSyncCommand(_ seconds: Double) -> String {
+        "microphone sync " + String(format: "%.3f", seconds.isFinite ? max(0, seconds) : 0)
+    }
+
     /// Audio for the Android mic: an imported video's PCM sidecar, or the Mac.
     /// Control command takes the full absolute path including spaces.
     static func videoMicrophoneCommand(_ config: VMConfig) -> String {
@@ -420,12 +425,13 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
         await agent.sampleProcesses(lock.withLock { processSink })
         // Settings › Devices › Cameras: the Mac's cameras, or scenes, while Android streams them.
         let cameras = launch.config.cameraFlags.isEmpty ? nil : CameraFeed(socketPath: controlPath, sources: launch.config.cameraSources,
-                                                                               framing: launch.config.cameraVideoFraming) { [weak self] camera in
-            // The movie starts from its beginning: its soundtrack, when it is
-            // the microphone, starts over with it. Not awaited: commands go
-            // one at a time, and the camera feed must not wait on them.
+                                                                               framing: launch.config.cameraVideoFraming) { [weak self] camera, seconds in
+            // The movie starts (from its beginning, or where it was moved)
+            // or moves: its soundtrack, when it is the microphone, goes
+            // there with it. Not awaited: commands go one at a time, and the
+            // camera feed must not wait on them.
             guard let self, camera == self.lock.withLock({ self.soundtrackCamera }) else { return }
-            Task { try? await control.send("microphone sync") }
+            Task { try? await control.send(Self.soundtrackSyncCommand(seconds)) }
         }
         let events = try control.events()
         let pump = Task {
@@ -1049,5 +1055,14 @@ extension VMMEngine: ActivityEngine {
 
     var engineProcessID: pid_t? {
         lock.withLock { process.flatMap { $0.isRunning ? $0.processIdentifier : nil } }
+    }
+}
+
+/// Settings › Devices › Cameras: where a camera's movie is, and moving it.
+extension VMMEngine: CameraVideoEngine {
+    func cameraVideoPlayback(camera: Int, seekTo seconds: Double?) async -> CameraVideoPlayback? {
+        let cameras = lock.withLock { self.cameras }
+        // Its soundtrack follows a move through CameraFeed's videoStarted.
+        return cameras?.videoPlayback(camera: camera, seekTo: seconds)
     }
 }

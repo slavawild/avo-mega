@@ -1,11 +1,11 @@
 import AvoKit
 import Foundation
 
-/// The movies Settings › Devices › Cameras can show as a camera
-/// (CameraSource.video): copies in Application Support/Avo/CameraVideos,
-/// each in a folder of its own under the name it had on the Mac, beside its
-/// soundtrack sidecar (VideoAudioExtractor). The daemon reads them there for
-/// good; the file panel's grant to the original passes.
+/// The movies and pictures Settings › Devices › Cameras can show as a
+/// camera (CameraSource.video): copies in Application Support/Avo/CameraVideos,
+/// each in a folder of its own under the name it had on the Mac, a movie
+/// beside its soundtrack sidecar (VideoAudioExtractor). The daemon reads
+/// them there for good; the file panel's grant to the original passes.
 ///
 /// The menu lists them all, so a movie can be chosen again without copying
 /// it again. Past the `kept` newest, those no camera shows go at the next
@@ -40,11 +40,12 @@ enum CameraVideos {
             .appending(path: "Avo/CameraVideos", directoryHint: .isDirectory)
     }
 
-    /// Copies a movie the user chose into `folder` and makes its soundtrack
-    /// sidecar, then lets go of old copies no camera shows (`inUse`: the
-    /// paths the cameras show now). Returns the copy's path, and a note for
-    /// the user when its sound cannot be the microphone (the camera works
-    /// anyway). Copying a long movie takes a while: run it off the main actor.
+    /// Copies a movie or picture the user chose into `folder` and makes a
+    /// movie's soundtrack sidecar, then lets go of old copies no camera
+    /// shows (`inUse`: the paths the cameras show now). Returns the copy's
+    /// path, and a note for the user when a movie's sound cannot be the
+    /// microphone (the camera works anyway). Copying a long movie takes a
+    /// while: run it off the main actor.
     static func importMovie(_ url: URL, inUse: Set<String>) async throws -> (path: String, note: String?) {
         let accessed = url.startAccessingSecurityScopedResource()
         defer { if accessed { url.stopAccessingSecurityScopedResource() } }
@@ -60,6 +61,8 @@ enum CameraVideos {
             throw error
         }
         prune(keeping: inUse.union([destination.path]))
+        // A picture has no sound to make into a sidecar.
+        if CameraSource.isPicture(destination.path) { return (destination.path, nil) }
         do {
             let sound = try await VideoAudioExtractor.createSidecar(for: destination)
             return (destination.path, sound ? nil : String(localized: "This video has no sound Avo can play, so its camera shows it without any."))
