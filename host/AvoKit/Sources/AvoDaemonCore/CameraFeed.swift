@@ -579,9 +579,10 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
                 return CameraVideoPlayback(playing: true, position: wanted, duration: nil)
             }
             let start = min(wanted, max(0, movie.duration - 0.001))
-            loopStart = clock.now.advanced(by: .seconds(-start))
             if pausedAt != nil { pausedAt = start }
             rewind(at: start)
+            // From when the reader is ready: opening it can take a while.
+            loopStart = clock.now.advanced(by: .seconds(-start))
             // The frame up now is from elsewhere in the movie: the next one decoded replaces it.
             lastFraming = nil
             return CameraVideoPlayback(playing: true, position: start, duration: movie.duration, paused: pausedAt != nil)
@@ -633,8 +634,10 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
         let start = (pendingStart ?? startAt).truncatingRemainder(dividingBy: movie.duration)
         pendingStart = nil
         if startsPaused { pausedAt = start }
-        loopStart = clock.now.advanced(by: .seconds(-start))
         rewind(at: start)
+        // From when the reader is ready: opening it can take a while (a
+        // decoder's first start), and the movie would be past `start` by then.
+        loopStart = clock.now.advanced(by: .seconds(-start))
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / max(request.fps, 1)), leeway: .milliseconds(3))
         timer.setEventHandler { [weak self] in self?.tick() }
