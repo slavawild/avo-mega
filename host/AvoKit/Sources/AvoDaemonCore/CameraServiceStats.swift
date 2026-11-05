@@ -109,3 +109,48 @@ struct CameraServiceStats: Equatable {
     /// start), threads by CPU, enough lines for the busiest.
     static let threadLoadCommand = "top -H -b -n 2 -d 1 -m 40"
 }
+
+/// Android's warnings and errors while a camera streams (`logcat -v epoch`,
+/// W and up), since the last look: what the camera HAL, cameraserver, a
+/// codec or the app says when frames go missing that every count above
+/// still calls delivered. Like messages (numbers aside) count once, the
+/// commonest first: "android warnings: 12× E ExtCamOutThr: Convert V4L2
+/// frame to YU12 failed! res -1; …".
+enum AndroidWarnings {
+    /// The first look takes the newest 300 lines; later ones those since `since`.
+    static func command(since: String?) -> String {
+        "logcat -d -v epoch " + (since.map { "-t '\($0)'" } ?? "-t 300") + " '*:W'"
+    }
+
+    /// The report (nil with none) and the newest line's time, for the next
+    /// look's `since`. Lines at or before `since` were reported already.
+    static func report(logcat output: String, since: String?, limit: Int = 8) -> (report: String?, last: String?) {
+        let after = since.flatMap(Double.init)
+        var last = since
+        var groups: [String: (level: String, tag: String, message: String, count: Int, order: Int)] = [:]
+        for raw in output.split(separator: "\n") {
+            // "1730800000.123  1234  1250 W Tag     : message"
+            let fields = raw.split(separator: " ", maxSplits: 4, omittingEmptySubsequences: true)
+            guard fields.count == 5, let time = Double(fields[0]), ["W", "E", "F"].contains(fields[3]) else { continue }
+            if let after, time <= after { continue }
+            last = String(fields[0])
+            let rest = fields[4]
+            guard let colon = rest.firstIndex(of: ":") else { continue }
+            let tag = rest[..<colon].trimmingCharacters(in: .whitespaces)
+            var message = rest[rest.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            if message.count > 160 { message = String(message.prefix(160)) + "…" }
+            let shape = message.replacingOccurrences(of: "[0-9]+", with: "#", options: .regularExpression)
+            let key = "\(fields[3]) \(tag) \(shape)"
+            if let group = groups[key] {
+                groups[key]?.count = group.count + 1
+            } else {
+                groups[key] = (String(fields[3]), tag, message, 1, groups.count)
+            }
+        }
+        guard !groups.isEmpty else { return (nil, last) }
+        let commonest = groups.values.sorted { ($0.count, -$0.order) > ($1.count, -$1.order) }.prefix(limit)
+        let parts = commonest.map { "\($0.count)× \($0.level) \($0.tag): \($0.message)" }
+        let more = groups.count > limit ? " (and \(groups.count - limit) more kinds)" : ""
+        return ("android warnings: " + parts.joined(separator: "; ") + more, last)
+    }
+}

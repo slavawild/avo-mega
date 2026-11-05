@@ -201,6 +201,7 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
                 cameraServiceWatch = Task {
                     let log = Logger(subsystem: AvoIdentifiers.logSubsystem, category: "cameras")
                     var previous: CameraServiceStats?
+                    var warningsSince: String?
                     while !Task.isCancelled {
                         try? await Task.sleep(for: .seconds(5))
                         guard !Task.isCancelled, let dump = try? await agent.cameraServiceDump() else { continue }
@@ -212,6 +213,12 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
                         // What Android's CPU is busy with meanwhile: where a slow camera waits.
                         if let top = try? await agent.threadLoad(), let busiest = CameraServiceStats.busiestThreads(top: top) {
                             log.notice("\(busiest, privacy: .public)")
+                        }
+                        // What Android complains of meanwhile: frames it lost on the way.
+                        if let logcat = try? await agent.androidWarnings(since: warningsSince) {
+                            let (report, last) = AndroidWarnings.report(logcat: logcat, since: warningsSince)
+                            if let report { log.notice("\(report, privacy: .public)") }
+                            warningsSince = last
                         }
                     }
                 }

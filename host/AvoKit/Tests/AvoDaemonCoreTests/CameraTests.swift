@@ -414,6 +414,26 @@ import Testing
         #expect(CameraServiceStats.busiestThreads(top: "nothing") == nil)
     }
 
+    /// Android's warnings count once per kind, the commonest first, and only
+    /// those after the last look.
+    @Test func androidWarningsAreCountedByKind() {
+        let logcat = """
+        --------- beginning of main
+        1730800000.100  1234  1250 E ExtCamOutThr: Convert V4L2 frame to YU12 failed! res -1
+        1730800000.200  1234  1250 E ExtCamOutThr: Convert V4L2 frame to YU12 failed! res -2
+        1730800000.300   999   999 W CameraService: Camera 0: dropped a frame
+        1730800000.400  1234  1250 I ExtCamOutThr: not a warning
+        """
+        let first = AndroidWarnings.report(logcat: logcat, since: nil)
+        #expect(first.report == "android warnings: 2× E ExtCamOutThr: Convert V4L2 frame to YU12 failed! res -1; 1× W CameraService: Camera 0: dropped a frame")
+        #expect(first.last == "1730800000.300")
+        let again = AndroidWarnings.report(logcat: logcat, since: first.last)
+        #expect(again.report == nil)
+        #expect(again.last == "1730800000.300")
+        #expect(AndroidWarnings.command(since: nil) == "logcat -d -v epoch -t 300 '*:W'")
+        #expect(AndroidWarnings.command(since: "1730800000.300") == "logcat -d -v epoch -t '1730800000.300' '*:W'")
+    }
+
     /// Phones record portrait movies sideways and say how to turn them.
     @Test func phoneMoviesAreTurnedUpright() {
         #expect(FileVideoCamera.orientation(.identity) == .up)
