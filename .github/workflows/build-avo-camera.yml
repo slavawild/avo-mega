@@ -17,9 +17,11 @@ on:
 permissions:
   contents: read
 
-# Keep only the newest test build while the branch is being developed.
+# Keep only the newest test build while the branch is being developed,
+# per runner image: a build queued on macos-15 and one on macos-26 can wait
+# side by side when GitHub is short of one of them.
 concurrency:
-  group: avo-mp4-camera-${{ github.ref }}
+  group: avo-mp4-camera-${{ github.ref }}-${{ inputs.runner || 'macos-26' }}
   cancel-in-progress: true
 
 jobs:
