@@ -414,14 +414,37 @@ impl Drop for PCMVideoMic {
 /// from the start). Off, Android records silence and the microphone is never
 /// opened, so macOS never asks for it; turning it off closes one that is
 /// open. The process's: it lasts through guest reboots.
-pub static MICROPHONE: Microphone =
-    Microphone { allowed: AtomicBool::new(true), video_paused: AtomicBool::new(false), file: Mutex::new(None), devices: Mutex::new(Vec::new()) };
+pub static MICROPHONE: Microphone = Microphone {
+    allowed: AtomicBool::new(true),
+    video_paused: AtomicBool::new(false),
+    timeline: Mutex::new(None),
+    file: Mutex::new(None),
+    devices: Mutex::new(Vec::new()),
+};
+
+/// Where the video whose soundtrack is the microphone is: `seconds` into
+/// it at `since`, playing on from there, or held at `seconds` while paused
+/// (`since` none).
+#[derive(Clone, Copy, Debug)]
+struct Timeline {
+    seconds: f64,
+    since: Option<Instant>,
+}
+
+impl Timeline {
+    fn now(&self, at: Instant) -> f64 {
+        self.seconds + self.since.map_or(0.0, |since| at.saturating_duration_since(since).as_secs_f64())
+    }
+}
 
 pub struct Microphone {
     allowed: AtomicBool,
     /// The video whose soundtrack is the microphone is paused: silence,
     /// and the soundtrack stays where it is.
     video_paused: AtomicBool,
+    /// Where that video is (`microphone sync`, `pause`, `play`): a recording
+    /// that starts later starts its soundtrack there, not at its beginning.
+    timeline: Mutex<Option<Timeline>>,
     /// Imported video's audio path; selected before recording starts.
     file: Mutex<Option<String>>,
     /// Every machine's sound device, to close its microphone.
@@ -429,7 +452,19 @@ pub struct Microphone {
 }
 
 impl Microphone {
-    pub fn set_file(&self, path: Option<String>) { *self.file.lock().unwrap() = path; }
+    pub fn set_file(&self, path: Option<String>) {
+        let mut file = self.file.lock().unwrap();
+        if *file != path {
+            // Another video's (or none): where the last one was says nothing of it.
+            *self.timeline.lock().unwrap() = None;
+        }
+        *file = path;
+    }
+
+    /// Seconds into the video now, as the last sync, pause and play said.
+    fn video_seconds(&self) -> Option<f64> {
+        self.timeline.lock().unwrap().map(|timeline| timeline.now(Instant::now()))
+    }
 
     fn file_path(&self) -> Option<String> { self.file.lock().unwrap().clone() }
 
@@ -438,6 +473,8 @@ impl Microphone {
     /// video is moved there), keeping both at the same moment even if
     /// recording began earlier. Past its end it wraps, as the video loops.
     pub fn sync_video(&self, seconds: f64) {
+        let since = (!self.video_paused()).then(Instant::now);
+        *self.timeline.lock().unwrap() = Some(Timeline { seconds, since });
         let mut devices = self.devices.lock().unwrap();
         devices.retain(|device| device.strong_count() > 0);
         for state in devices.iter().filter_map(Weak::upgrade) {
@@ -450,6 +487,11 @@ impl Microphone {
     /// The video camera's movie paused (`microphone pause`) or plays on.
     pub fn pause_video(&self, paused: bool) {
         self.video_paused.store(paused, Ordering::Release);
+        let now = Instant::now();
+        if let Some(timeline) = self.timeline.lock().unwrap().as_mut() {
+            // Held where it is, or playing on from there.
+            *timeline = Timeline { seconds: timeline.now(now), since: (!paused).then_some(now) };
+        }
     }
 
     fn video_paused(&self) -> bool {
@@ -673,6 +715,10 @@ impl Sound {
                 let entry = &mut state.streams[CAPTURE];
                 entry.video_mode = file_path.is_some();
                 entry.video_audio = file_path.as_deref().and_then(PCMVideoMic::open);
+                // Recording starts where the video is now, not at its beginning.
+                if let (Some(soundtrack), Some(seconds)) = (entry.video_audio.as_mut(), MICROPHONE.video_seconds()) {
+                    soundtrack.position = soundtrack.at(seconds);
+                }
                 entry.priming = !entry.video_mode;
             }
             spawn_clock(&self.state, stream, id, params);
@@ -1538,6 +1584,16 @@ mod tests {
         for value in lefts(&resample(&source, &mut position, &mut filter, 11_025, 2, 2_000 * 4), 2) {
             assert_eq!(value, 1_234.0);
         }
+    }
+
+    #[test]
+    fn the_video_timeline_plays_on_and_holds_when_paused() {
+        let start = Instant::now();
+        let playing = Timeline { seconds: 10.0, since: Some(start) };
+        assert_eq!(playing.now(start + Duration::from_millis(2_500)), 12.5);
+        assert_eq!(playing.now(start), 10.0);
+        let paused = Timeline { seconds: 10.0, since: None };
+        assert_eq!(paused.now(start + Duration::from_secs(60)), 10.0);
     }
 
     #[test]
