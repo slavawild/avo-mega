@@ -504,14 +504,20 @@ impl State {
     /// Hands `jpeg` to the guest in its oldest queued buffer and returns
     /// that buffer's index; None when it has none queued (it has not given
     /// the last ones back yet), and the frame goes.
-    fn deliver(&mut self, id: u32, jpeg: &[u8]) -> Option<usize> {
+    fn deliver(&mut self, id: u32, jpeg: &[u8], pick: Pick) -> Option<usize> {
         let session = self.sessions.get_mut(&id).filter(|s| s.streaming)?;
-        let &index = session.queue.front()?;
+        let position = match pick {
+            Pick::Oldest => 0,
+            Pick::Only(index) => session.queue.iter().position(|&i| i == index)?,
+            Pick::WhenAllQueued if session.queue.len() < session.buffers.len() => return None,
+            Pick::WhenAllQueued => 0,
+        };
+        let index = *session.queue.get(position)?;
         let buffer = &mut session.buffers[index];
         if jpeg.len() > buffer.length as usize {
             return None;
         }
-        session.queue.pop_front();
+        session.queue.remove(position);
         self.region.write(buffer.offset, jpeg);
         buffer.queued = false;
         buffer.bytesused = jpeg.len() as u32;
@@ -577,7 +583,11 @@ fn stream(shared: Arc<Mutex<State>>, hub: &'static Hub, camera: usize, id: u32, 
     let mut next = Instant::now() + interval;
     let mut stats = StreamStats::default();
     let mut reported = Instant::now();
+    let started = Instant::now();
+    let mut frozen: Option<Arc<Vec<u8>>> = None;
     while !stop.load(Ordering::Acquire) {
+        let (trial, pick) = TRIALS[(started.elapsed().as_secs() / TRIAL_LENGTH.as_secs()) as usize % TRIALS.len()];
+        stats.trial = trial;
         if reported.elapsed() >= STATS_INTERVAL {
             hub.report(stats.line(camera, format, reported.elapsed()));
             stats = StreamStats::default();
@@ -627,7 +637,15 @@ fn stream(shared: Arc<Mutex<State>>, hub: &'static Hub, camera: usize, id: u32, 
                 }
             }
         };
-        let delivered = shared.lock().unwrap().deliver(id, &jpeg);
+        // `freeze`: the same JPEG every time, the one handed over last before it.
+        let (jpeg, new) = if trial == "freeze" {
+            let same = frozen.get_or_insert_with(|| last.as_ref().map(|(jpeg, _)| jpeg.clone()).unwrap_or_else(|| gray.clone())).clone();
+            (same, false)
+        } else {
+            frozen = None;
+            (jpeg, new)
+        };
+        let delivered = shared.lock().unwrap().deliver(id, &jpeg, pick);
         if let Some(index) = delivered {
             stats.took(index, &jpeg);
         } else if new {
@@ -641,6 +659,28 @@ fn stream(shared: Arc<Mutex<State>>, hub: &'static Hub, camera: usize, id: u32, 
         }
     }
 }
+
+/// Which queued buffer a frame goes into.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Pick {
+    /// The oldest queued.
+    Oldest,
+    /// This one, when it is queued (else none).
+    Only(usize),
+    /// The oldest, only while Android holds none of them.
+    WhenAllQueued,
+}
+
+/// A diagnostic build's trials, 20 seconds each in turn from the stream's
+/// start, named in `camerastats`: how often Android's camera HAL rejects
+/// frames ("Convert V4L2 frame to YU12 failed") under each tells what it
+/// depends on. `normal` is the camera as it is; `freeze` hands over the same
+/// JPEG every time (the bytes never change); `buffer0` puts new frames
+/// only in buffer 0; `one-at-a-time` hands a frame over only while Android
+/// holds no buffer.
+const TRIALS: [(&str, Pick); 4] =
+    [("normal", Pick::Oldest), ("freeze", Pick::Oldest), ("buffer0", Pick::Only(0)), ("one-at-a-time", Pick::WhenAllQueued)];
+const TRIAL_LENGTH: Duration = Duration::from_secs(20);
 
 /// How often a stream reports (`camerastats`).
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
@@ -661,6 +701,8 @@ struct StreamStats {
     /// Frames put through jpeg::baseline, and the time it took them.
     rewritten: u32,
     rewriting: Duration,
+    /// The trial running (TRIALS).
+    trial: &'static str,
     /// The buffers frames went into (bit per index).
     buffers: u32,
     /// What the JPEGs taken say of themselves (camera::jpeg_kind), how many each.
@@ -698,6 +740,7 @@ impl StreamStats {
             rate(self.fed), rate(self.taken), rate(self.no_buffer), rate(self.repeated), rate(self.as_is),
             self.rewriting.as_secs_f64() * 1000.0 / self.rewritten.max(1) as f64
         );
+        line += &format!("; trial {}", self.trial);
         if self.taken > 0 {
             let kinds: Vec<String> = self.kinds.iter().map(|(kind, n)| format!("{kind} {:.1}/s", rate(*n))).collect();
             line += &format!(
@@ -974,8 +1017,8 @@ mod tests {
         // S_FMT may not change a streaming session.
         assert_eq!(ioctl(&mut state, id, VIDIOC_S_FMT, &sized(&[BUF_TYPE_VIDEO_CAPTURE, 0, 640, 480], 208)).0, EBUSY);
 
-        state.deliver(id, b"\xff\xd8first").unwrap();
-        state.deliver(id, b"\xff\xd8second").unwrap();
+        state.deliver(id, b"\xff\xd8first", Pick::Oldest).unwrap();
+        state.deliver(id, b"\xff\xd8second", Pick::Oldest).unwrap();
         assert_eq!(state.region.read(buffers[0].0, 7), b"\xff\xd8first");
         assert_eq!(state.region.read(buffers[1].0, 8), b"\xff\xd8second");
         let (session, event) = &state.events[1];
@@ -986,20 +1029,36 @@ mod tests {
         assert_eq!(u64::from_le_bytes(event[8 + 64..8 + 72].try_into().unwrap()), buffers[1].0);
 
         // Too big for a buffer: left out, the buffer stays queued.
-        state.deliver(id, &vec![0; length as usize + 1]);
+        state.deliver(id, &vec![0; length as usize + 1], Pick::Oldest);
         assert_eq!(state.events.len(), 2);
         assert_eq!(state.sessions[&id].queue, [2, 3]);
 
         assert_eq!(ioctl(&mut state, id, VIDIOC_STREAMOFF, &cmd(&[BUF_TYPE_VIDEO_CAPTURE])).0, 0);
         assert!(state.events.is_empty(), "events of a stopped stream are dropped");
         assert!(state.sessions[&id].queue.is_empty());
-        state.deliver(id, b"late");
+        state.deliver(id, b"late", Pick::Oldest);
         assert!(state.events.is_empty());
         assert_eq!(heard.lock().unwrap().last().unwrap(), "camera 0 off");
         // REQBUFS(0) frees them, CLOSE ends the session.
         assert_eq!(ioctl(&mut state, id, VIDIOC_REQBUFS, &sized(&[0, BUF_TYPE_VIDEO_CAPTURE, MEMORY_MMAP], 20)).0, 0);
         assert!(state.command(&cmd(&[CMD_CLOSE, 0, id, 0])).is_empty());
         assert!(state.sessions.is_empty());
+    }
+
+    #[test]
+    fn trials_pick_their_buffer() {
+        let mut state = state(true);
+        let id = open(&mut state);
+        queue_buffers(&mut state, id, 4);
+        assert_eq!(ioctl(&mut state, id, VIDIOC_STREAMON, &cmd(&[BUF_TYPE_VIDEO_CAPTURE])).0, 0);
+        // While Android holds none, the oldest; then none until all are back.
+        assert_eq!(state.deliver(id, b"\xff\xd8a", Pick::WhenAllQueued), Some(0));
+        assert_eq!(state.deliver(id, b"\xff\xd8b", Pick::WhenAllQueued), None);
+        // Buffer 0 only while it is queued; another one when asked for.
+        assert_eq!(state.deliver(id, b"\xff\xd8c", Pick::Only(0)), None);
+        assert_eq!(state.deliver(id, b"\xff\xd8d", Pick::Only(2)), Some(2));
+        assert_eq!(state.sessions[&id].queue, [1, 3]);
+        assert_eq!(state.deliver(id, b"\xff\xd8e", Pick::Oldest), Some(1));
     }
 
     #[test]
