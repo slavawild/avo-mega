@@ -289,6 +289,55 @@ impl BitWriter {
     }
 }
 
+/// What a JPEG says of itself before its scan, for `camerastats`:
+/// "1920x1080 sof0 h2v2,h1v1,h1v1", with " dri<n>" for restart markers,
+/// " app<n>…" for the APP segments it carries, and " no-eoi" when it does
+/// not end in EOI. "bad" when its markers make no sense.
+pub fn jpeg_kind(jpeg: &[u8]) -> String {
+    if jpeg.len() < 4 || jpeg[..2] != [0xff, 0xd8] {
+        return "bad".into();
+    }
+    let mut kind = String::new();
+    let mut extras = Vec::new();
+    let mut at = 2;
+    loop {
+        let Some(&[0xff, marker]) = jpeg.get(at..at + 2) else { return "bad".into() };
+        if marker == 0xff {
+            at += 1;
+            continue;
+        }
+        let Some(&[hi, lo]) = jpeg.get(at + 2..at + 4) else { return "bad".into() };
+        let length = usize::from(u16::from_be_bytes([hi, lo]));
+        let Some(segment) = jpeg.get(at + 4..at + 2 + length) else { return "bad".into() };
+        match marker {
+            0xc0..=0xcf if ![0xc4, 0xc8, 0xcc].contains(&marker) && segment.len() >= 6 => {
+                let height = u16::from_be_bytes([segment[1], segment[2]]);
+                let width = u16::from_be_bytes([segment[3], segment[4]]);
+                let sampling: Vec<String> = segment[6..].chunks(3).filter(|c| c.len() == 3)
+                    .map(|c| format!("h{}v{}", c[1] >> 4, c[1] & 15)).collect();
+                kind = format!("{width}x{height} sof{} {}", marker - 0xc0, sampling.join(","));
+            }
+            0xdd if segment.len() >= 2 => extras.push(format!("dri{}", u16::from_be_bytes([segment[0], segment[1]]))),
+            0xe0..=0xef => extras.push(format!("app{}", marker - 0xe0)),
+            0xda => break,
+            _ => {}
+        }
+        at += 2 + length;
+    }
+    if kind.is_empty() {
+        return "bad".into();
+    }
+    extras.dedup();
+    for extra in extras {
+        kind += " ";
+        kind += &extra;
+    }
+    if jpeg[jpeg.len() - 2..] != [0xff, 0xd9] {
+        kind += " no-eoi";
+    }
+    kind
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +361,16 @@ mod tests {
         assert!(jpeg.len() < 8300, "{}", jpeg.len());
         let dark = gray_jpeg(640, 480, 16);
         assert!(dark.windows(2).filter(|w| *w == [0xff, 0xd9]).count() == 1);
+    }
+
+    #[test]
+    fn jpegs_say_their_size_and_sampling() {
+        assert_eq!(jpeg_kind(&gray_jpeg(1920, 1080, 128)), "1920x1080 sof0 h1v1");
+        let mut cut = gray_jpeg(640, 480, 128);
+        cut.truncate(cut.len() - 1);
+        assert_eq!(jpeg_kind(&cut), "640x480 sof0 h1v1 no-eoi");
+        assert_eq!(jpeg_kind(b"\xff\xd8\xff\xe0\x00"), "bad");
+        assert_eq!(jpeg_kind(b"nope"), "bad");
     }
 
     #[test]

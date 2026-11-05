@@ -141,21 +141,6 @@ fn nearest_size(width: u32, height: u32) -> (u32, u32) {
     SIZES.iter().copied().find(|&(w, h)| w >= width && h >= height).unwrap_or(SIZES[SIZES.len() - 1])
 }
 
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    /// libkern/OSCacheControl.h: cleans and invalidates the data cache
-    /// lines of a range to the point of coherency.
-    fn sys_dcache_flush(start: *mut libc::c_void, len: usize);
-}
-
-/// Cleans `len` bytes at `at` out of the data caches (to memory).
-unsafe fn flush_dcache(at: *mut u8, len: usize) {
-    #[cfg(target_os = "macos")]
-    unsafe { sys_dcache_flush(at.cast(), len) };
-    #[cfg(not(target_os = "macos"))]
-    let _ = (at, len);
-}
-
 /// The device's buffer memory: host pages mapped at the BAR.
 struct Region {
     host: *mut u8,
@@ -193,20 +178,9 @@ impl Region {
         }
     }
 
-    /// Writes `data` at `offset` and pushes it out of the Mac's caches to
-    /// memory. The guest may map its buffers uncached (Apple's Hypervisor
-    /// cannot force them cached, as KVM's FWB does): it then reads memory
-    /// itself and would find the last frames' bytes wherever this one's
-    /// still sat in a cache. Such frames were malformed JPEGs to the camera
-    /// HAL ("Convert V4L2 frame to YU12 failed"), most of all the larger
-    /// ones of a movie, and apps recorded about 18 of 30 a second.
     fn write(&mut self, offset: u64, data: &[u8]) {
         assert!(offset + data.len() as u64 <= self.len);
-        unsafe {
-            let at = self.host.add(offset as usize);
-            std::ptr::copy_nonoverlapping(data.as_ptr(), at, data.len());
-            flush_dcache(at, data.len());
-        }
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.host.add(offset as usize), data.len()) };
     }
 
     #[cfg(test)]
@@ -527,17 +501,15 @@ impl State {
         }
     }
 
-    /// Puts `jpeg` in the oldest queued buffer of streaming session `id`
-    /// and returns it to the driver; no buffer queued, no frame.
-    /// Hands `jpeg` to the guest in its oldest queued buffer; false when
-    /// it has none queued (it has not given the last ones back yet), and
-    /// the frame goes.
-    fn deliver(&mut self, id: u32, jpeg: &[u8]) -> bool {
-        let Some(session) = self.sessions.get_mut(&id).filter(|s| s.streaming) else { return false };
-        let Some(&index) = session.queue.front() else { return false };
+    /// Hands `jpeg` to the guest in its oldest queued buffer and returns
+    /// that buffer's index; None when it has none queued (it has not given
+    /// the last ones back yet), and the frame goes.
+    fn deliver(&mut self, id: u32, jpeg: &[u8]) -> Option<usize> {
+        let session = self.sessions.get_mut(&id).filter(|s| s.streaming)?;
+        let &index = session.queue.front()?;
         let buffer = &mut session.buffers[index];
         if jpeg.len() > buffer.length as usize {
-            return false;
+            return None;
         }
         session.queue.pop_front();
         self.region.write(buffer.offset, jpeg);
@@ -554,7 +526,7 @@ impl State {
             self.events.pop_front();
         }
         self.flush_events();
-        true
+        Some(index)
     }
 
     fn flush_events(&mut self) {
@@ -643,8 +615,8 @@ fn stream(shared: Arc<Mutex<State>>, hub: &'static Hub, camera: usize, id: u32, 
             }
         };
         let delivered = shared.lock().unwrap().deliver(id, &jpeg);
-        if delivered {
-            stats.taken += 1;
+        if let Some(index) = delivered {
+            stats.took(index, &jpeg);
         } else if new {
             // No buffer queued now: it goes at the next frame time.
             fresh = Some(jpeg);
@@ -671,17 +643,51 @@ struct StreamStats {
     no_buffer: u32,
     /// The last frame (or gray) again, none newer having come.
     repeated: u32,
+    /// The buffers frames went into (bit per index).
+    buffers: u32,
+    /// What the JPEGs taken say of themselves (camera::jpeg_kind), how many each.
+    kinds: BTreeMap<String, u32>,
+    /// The smallest and largest JPEG taken, in bytes.
+    smallest: usize,
+    largest: usize,
+    /// JPEGs taken over 64, 128, 256 and 512 KiB.
+    over: [u32; 4],
 }
 
 impl StreamStats {
-    /// `camerastats <index> <w>x<h> <fps> fed <n>/s taken <n>/s no-buffer <n>/s repeated <n>/s`.
+    /// A frame went to Android in buffer `index`.
+    fn took(&mut self, index: usize, jpeg: &[u8]) {
+        self.taken += 1;
+        self.buffers |= 1 << index.min(31);
+        *self.kinds.entry(camera::jpeg_kind(jpeg)).or_default() += 1;
+        self.smallest = if self.taken == 1 { jpeg.len() } else { self.smallest.min(jpeg.len()) };
+        self.largest = self.largest.max(jpeg.len());
+        for (i, limit) in [64usize, 128, 256, 512].iter().enumerate() {
+            if jpeg.len() > limit << 10 {
+                self.over[i] += 1;
+            }
+        }
+    }
+
+    /// `camerastats <index> <w>x<h> <fps> fed <n>/s taken <n>/s no-buffer
+    /// <n>/s repeated <n>/s`, then what the JPEGs taken were: in how many
+    /// buffers, their kinds, sizes, and how many a second were large.
     fn line(&self, camera: usize, format: Format, over: Duration) -> String {
         let rate = |n: u32| n as f64 / over.as_secs_f64().max(0.001);
-        format!(
+        let mut line = format!(
             "camerastats {camera} {}x{} {} fed {:.1}/s taken {:.1}/s no-buffer {:.1}/s repeated {:.1}/s",
             format.width, format.height, format.fps,
             rate(self.fed), rate(self.taken), rate(self.no_buffer), rate(self.repeated)
-        )
+        );
+        if self.taken > 0 {
+            let kinds: Vec<String> = self.kinds.iter().map(|(kind, n)| format!("{kind} {:.1}/s", rate(*n))).collect();
+            line += &format!(
+                "; jpeg in {} buffers: {}; {}-{} KiB, over 64/128/256/512 KiB {:.1}/{:.1}/{:.1}/{:.1} a second",
+                self.buffers.count_ones(), kinds.join(", "), self.smallest >> 10, self.largest >> 10,
+                rate(self.over[0]), rate(self.over[1]), rate(self.over[2]), rate(self.over[3])
+            );
+        }
+        line
     }
 }
 
@@ -949,8 +955,8 @@ mod tests {
         // S_FMT may not change a streaming session.
         assert_eq!(ioctl(&mut state, id, VIDIOC_S_FMT, &sized(&[BUF_TYPE_VIDEO_CAPTURE, 0, 640, 480], 208)).0, EBUSY);
 
-        state.deliver(id, b"\xff\xd8first");
-        state.deliver(id, b"\xff\xd8second");
+        state.deliver(id, b"\xff\xd8first").unwrap();
+        state.deliver(id, b"\xff\xd8second").unwrap();
         assert_eq!(state.region.read(buffers[0].0, 7), b"\xff\xd8first");
         assert_eq!(state.region.read(buffers[1].0, 8), b"\xff\xd8second");
         let (session, event) = &state.events[1];

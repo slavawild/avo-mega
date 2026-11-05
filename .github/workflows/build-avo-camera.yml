@@ -77,6 +77,7 @@ jobs:
           cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm --no-run
           cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm virtio::sound::
           cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm control::tests::microphone
+          cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm camera::tests::jpegs_say
 
       - name: Test camera models and camera feed
         run: |
