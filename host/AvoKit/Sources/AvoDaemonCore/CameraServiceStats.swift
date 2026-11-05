@@ -117,6 +117,10 @@ struct CameraServiceStats: Equatable {
 /// commonest first: "android warnings: 12× E ExtCamOutThr: Convert V4L2
 /// frame to YU12 failed! res -1; …".
 enum AndroidWarnings {
+    /// Tags whose warnings come with or without a camera (MediaProvider's
+    /// on every file an app writes; services this Android image lacks).
+    static let quiet: Set<String> = ["MediaProvider", "libbinder.ServiceManagerCppClient", "libc", "init", "DevicePolicyManager"]
+
     /// The first look takes the newest 300 lines; later ones those since `since`.
     static func command(since: String?) -> String {
         "logcat -d -v epoch " + (since.map { "-t '\($0)'" } ?? "-t 300") + " '*:W'"
@@ -138,6 +142,8 @@ enum AndroidWarnings {
             guard let colon = rest.firstIndex(of: ":") else { continue }
             let tag = rest[..<colon].trimmingCharacters(in: .whitespaces)
             var message = rest[rest.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            // Stack traces, and services that complain whatever the camera does.
+            if message.hasPrefix("at ") || message.hasPrefix("Caused by") || message.hasPrefix("... ") || quiet.contains(tag) { continue }
             if message.count > 160 { message = String(message.prefix(160)) + "…" }
             let shape = message.replacingOccurrences(of: "[0-9]+", with: "#", options: .regularExpression)
             let key = "\(fields[3]) \(tag) \(shape)"

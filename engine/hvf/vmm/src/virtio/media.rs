@@ -141,6 +141,21 @@ fn nearest_size(width: u32, height: u32) -> (u32, u32) {
     SIZES.iter().copied().find(|&(w, h)| w >= width && h >= height).unwrap_or(SIZES[SIZES.len() - 1])
 }
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    /// libkern/OSCacheControl.h: cleans and invalidates the data cache
+    /// lines of a range to the point of coherency.
+    fn sys_dcache_flush(start: *mut libc::c_void, len: usize);
+}
+
+/// Cleans `len` bytes at `at` out of the data caches (to memory).
+unsafe fn flush_dcache(at: *mut u8, len: usize) {
+    #[cfg(target_os = "macos")]
+    unsafe { sys_dcache_flush(at.cast(), len) };
+    #[cfg(not(target_os = "macos"))]
+    let _ = (at, len);
+}
+
 /// The device's buffer memory: host pages mapped at the BAR.
 struct Region {
     host: *mut u8,
@@ -178,9 +193,20 @@ impl Region {
         }
     }
 
+    /// Writes `data` at `offset` and pushes it out of the Mac's caches to
+    /// memory. The guest may map its buffers uncached (Apple's Hypervisor
+    /// cannot force them cached, as KVM's FWB does): it then reads memory
+    /// itself and would find the last frames' bytes wherever this one's
+    /// still sat in a cache. Such frames were malformed JPEGs to the camera
+    /// HAL ("Convert V4L2 frame to YU12 failed"), most of all the larger
+    /// ones of a movie, and apps recorded about 18 of 30 a second.
     fn write(&mut self, offset: u64, data: &[u8]) {
         assert!(offset + data.len() as u64 <= self.len);
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.host.add(offset as usize), data.len()) };
+        unsafe {
+            let at = self.host.add(offset as usize);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), at, data.len());
+            flush_dcache(at, data.len());
+        }
     }
 
     #[cfg(test)]
