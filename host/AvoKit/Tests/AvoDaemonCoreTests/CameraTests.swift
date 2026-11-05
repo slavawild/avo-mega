@@ -386,6 +386,15 @@ import Testing
         #expect(later.report(since: first)
                 == "android streams: camera 1/0 640x480 0x22 SurfaceView - org.telegram.messenger/org.telegram.ui.LaunchActivity#0: 30.0 fps; camera 1/1 384x384 0x22 GraphicBufferSource: 19.0 fps")
         #expect(CameraServiceStats(dump: "", at: start).report(since: first) == nil)
+        // The same stream listed twice is two streams, each against its own earlier count.
+        let twice = { (frames: Int, total: Int) in
+            "Device 101 is open.\n  Stream[0]: Output\n  Dims: 640 x 480, format 0x23, dataspace 0x0\n  Frames produced: \(frames), last timestamp: 1 ns\n"
+                + "  Stream[0]: Output\n  Dims: 640 x 480, format 0x23, dataspace 0x0\n  Frames produced: \(total), last timestamp: 1 ns\n"
+        }
+        let a = CameraServiceStats(dump: twice(100, 5000), at: start)
+        #expect(a.streams.map(\.key) == ["?/0", "?/0#2"])
+        let b = CameraServiceStats(dump: twice(250, 5150), at: start.advanced(by: .seconds(5)))
+        #expect(b.report(since: a) == "android streams: camera ?/0 640x480 0x23: 30.0 fps; camera ?/0#2 640x480 0x23: 30.0 fps")
     }
 
     /// Phones record portrait movies sideways and say how to turn them.

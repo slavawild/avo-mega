@@ -23,10 +23,17 @@ struct CameraServiceStats: Equatable {
         var camera = "?"
         var index: String?
         var consumer = "", dims = ""
+        // The dump can list a stream twice (the device's configuration and
+        // its client's): each listing counts on its own, by its turn.
+        var seen: [String: Int] = [:]
         func flush(frames: Int) {
             guard let index else { return }
             let description = [dims, consumer].filter { !$0.isEmpty }.joined(separator: " ")
-            streams.append(Stream(key: "\(camera)/\(index)", description: description, frames: frames))
+            var key = "\(camera)/\(index)"
+            let turn = (seen[key] ?? 0) + 1
+            seen[key] = turn
+            if turn > 1 { key += "#\(turn)" }
+            streams.append(Stream(key: key, description: description, frames: frames))
         }
         for raw in dump.split(separator: "\n", omittingEmptySubsequences: true) {
             let line = raw.trimmingCharacters(in: .whitespaces)
