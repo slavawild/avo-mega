@@ -84,6 +84,7 @@ jobs:
           swift test --filter CameraSettingsTests
           swift test --filter CameraFeedTests
           swift test --filter DeviceSettingsTests
+          swift test --filter GuestCameraTests
 
       - name: Build Avo for Apple Silicon
         run: |

@@ -142,8 +142,9 @@ enum GuestCamera {
                 </ignore>
             </Provider>
             <Device>
-                <!-- As a phone's: frames come a quarter turned, and apps turn them upright
-                     (CameraFeed.sensorOrientation); photos say how to show them. -->
+                <!-- Turned as on a phone: frames come a quarter turned, and apps turn them
+                     upright (CameraFeed.sensorOrientation); photos say how to show them.
+                     No apostrophes here: this goes through printf in single quotes. -->
                 <Orientation degree="90"/>
                 <NumVideoBuffers count="4"/>
                 <NumStillBuffers count="2"/>
