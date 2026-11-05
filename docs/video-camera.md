@@ -80,3 +80,12 @@ A picture (JPEG, PNG, HEIC, anything ImageIO reads) is imported like a movie, in
 ## Moving the video
 
 Under a camera's movie, Settings › Devices › Cameras has a slider: where the movie is (followed twice a second) and, dragged, where it goes (`DaemonClient.cameraVideoPlayback`, XPC `cameraVideoPlayback`). `FileVideoCamera.seek` starts a new reader there and moves its loop's start; its soundtrack, when it is the microphone, goes to the same second (`microphone sync <seconds>`). Beside it, ⏮ starts the movie over and ⏯ pauses it: paused, the camera sends the frame where it stopped again and again, and its soundtrack, when it is the microphone, is silent and stays there (`microphone pause` / `microphone play`). While no app uses the camera, a moved or paused movie starts there, and so, the next time it plays; choosing another source plays it again.
+
+
+## Camera2 diagnostics (AnonChat badge investigation)
+
+To inspect the Camera2 characteristics, capture requests and HAL logs for this
+virtual camera without changing its behavior, use the read-only
+[Camera2 diagnostics guide](camera-diagnostics.md). Run the collector once on
+Avo (file-backed and, optionally, Mac webcam) and once on a real Android phone,
+then compare their reports before changing camera metadata.
