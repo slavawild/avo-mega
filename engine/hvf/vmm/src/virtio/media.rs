@@ -504,17 +504,27 @@ impl State {
     /// Hands `jpeg` to the guest in its oldest queued buffer and returns
     /// that buffer's index; None when it has none queued (it has not given
     /// the last ones back yet), and the frame goes.
+    ///
+    /// Every frame says it fills its whole buffer, which ends in EOI: the
+    /// JPEG is at the start, and what lies between is the rest of older
+    /// frames, which a decoder never reaches (it stops at the JPEG's own
+    /// EOI). With `bytesused` the JPEG's own length, Android's camera HAL
+    /// rejected about half of a movie's frames, all of them whole (frames of
+    /// one size, the gray ones, it read): as if it took a length an older
+    /// frame in the same buffer had, cutting off each frame larger than it.
+    /// A length that never changes cannot be an older one.
     fn deliver(&mut self, id: u32, jpeg: &[u8]) -> Option<usize> {
         let session = self.sessions.get_mut(&id).filter(|s| s.streaming)?;
         let &index = session.queue.front()?;
         let buffer = &mut session.buffers[index];
-        if jpeg.len() > buffer.length as usize {
+        if jpeg.len() + 2 > buffer.length as usize {
             return None;
         }
         session.queue.pop_front();
         self.region.write(buffer.offset, jpeg);
+        self.region.write(buffer.offset + buffer.length as u64 - 2, &[0xff, 0xd9]);
         buffer.queued = false;
-        buffer.bytesused = jpeg.len() as u32;
+        buffer.bytesused = buffer.length;
         session.sequence = session.sequence.wrapping_add(1);
         let mut event = vec![0u8; EVENT_SIZE];
         put(&mut event, 0, EVT_DQBUF);
@@ -594,16 +604,7 @@ fn stream(shared: Arc<Mutex<State>>, hub: &'static Hub, camera: usize, id: u32, 
                 stats.no_buffer += 1;
             }
             stats.fed += 1;
-            // As a plain baseline JPEG, which the camera HAL reads whole (jpeg.rs).
-            let jpeg = match crate::jpeg::baseline(&frame.jpeg) {
-                Some(plain) => Arc::new(plain),
-                None => {
-                    stats.as_is += 1;
-                    frame.jpeg
-                }
-            };
-            last = Some((jpeg.clone(), Instant::now()));
-            fresh = Some(jpeg);
+            fresh = Some(frame.jpeg);
             if stop.load(Ordering::Acquire) {
                 return;
             }
@@ -613,7 +614,21 @@ fn stream(shared: Arc<Mutex<State>>, hub: &'static Hub, camera: usize, id: u32, 
         }
         let now = Instant::now();
         let (jpeg, new) = match fresh.take() {
-            Some(jpeg) => (jpeg, true),
+            Some(jpeg) => {
+                // As a plain baseline JPEG (jpeg.rs), once it is the one to go.
+                let started = Instant::now();
+                let jpeg = match crate::jpeg::baseline(&jpeg) {
+                    Some(plain) => Arc::new(plain),
+                    None => {
+                        stats.as_is += 1;
+                        jpeg
+                    }
+                };
+                stats.rewriting += started.elapsed();
+                stats.rewritten += 1;
+                last = Some((jpeg.clone(), now));
+                (jpeg, true)
+            }
             None => {
                 stats.repeated += 1;
                 match &last {
@@ -653,6 +668,9 @@ struct StreamStats {
     repeated: u32,
     /// New frames jpeg::baseline could not rewrite: they went as they came.
     as_is: u32,
+    /// Frames put through jpeg::baseline, and the time it took them.
+    rewritten: u32,
+    rewriting: Duration,
     /// The buffers frames went into (bit per index).
     buffers: u32,
     /// What the JPEGs taken say of themselves (camera::jpeg_kind), how many each.
@@ -680,14 +698,15 @@ impl StreamStats {
     }
 
     /// `camerastats <index> <w>x<h> <fps> fed <n>/s taken <n>/s no-buffer
-    /// <n>/s repeated <n>/s not-rewritten <n>/s`, then what the JPEGs taken were: in how many
+    /// <n>/s repeated <n>/s not-rewritten <n>/s rewrite <ms> ms`, then what the JPEGs taken were: in how many
     /// buffers, their kinds, sizes, and how many a second were large.
     fn line(&self, camera: usize, format: Format, over: Duration) -> String {
         let rate = |n: u32| n as f64 / over.as_secs_f64().max(0.001);
         let mut line = format!(
-            "camerastats {camera} {}x{} {} fed {:.1}/s taken {:.1}/s no-buffer {:.1}/s repeated {:.1}/s not-rewritten {:.1}/s",
+            "camerastats {camera} {}x{} {} fed {:.1}/s taken {:.1}/s no-buffer {:.1}/s repeated {:.1}/s not-rewritten {:.1}/s rewrite {:.1} ms",
             format.width, format.height, format.fps,
-            rate(self.fed), rate(self.taken), rate(self.no_buffer), rate(self.repeated), rate(self.as_is)
+            rate(self.fed), rate(self.taken), rate(self.no_buffer), rate(self.repeated), rate(self.as_is),
+            self.rewriting.as_secs_f64() * 1000.0 / self.rewritten.max(1) as f64
         );
         if self.taken > 0 {
             let kinds: Vec<String> = self.kinds.iter().map(|(kind, n)| format!("{kind} {:.1}/s", rate(*n))).collect();
@@ -972,8 +991,10 @@ mod tests {
         let (session, event) = &state.events[1];
         assert_eq!((*session, event.len()), (id, EVENT_SIZE));
         assert_eq!((get(event, 0), get(event, 4)), (EVT_DQBUF, id));
-        // The v4l2_buffer: index, bytesused, sequence, memory, offset.
-        assert_eq!((get(event, 8), get(event, 16), get(event, 8 + 56), get(event, 8 + 60)), (1, 8, 2, MEMORY_MMAP));
+        // The v4l2_buffer: index, bytesused (the whole buffer, ending in
+        // EOI), sequence, memory, offset.
+        assert_eq!((get(event, 8), get(event, 16), get(event, 8 + 56), get(event, 8 + 60)), (1, length as u32, 2, MEMORY_MMAP));
+        assert_eq!(state.region.read(buffers[1].0 + length - 2, 2), [0xff, 0xd9]);
         assert_eq!(u64::from_le_bytes(event[8 + 64..8 + 72].try_into().unwrap()), buffers[1].0);
 
         // Too big for a buffer: left out, the buffer stays queued.
@@ -1124,8 +1145,11 @@ mod tests {
             event
         };
         let gray = camera::gray_jpeg(640, 480, 128);
-        assert_eq!((get(&event(0), 0), get(&event(0), 8), get(&event(0), 16)), (EVT_DQBUF, 0, gray.len() as u32));
+        // Every frame fills its whole buffer, which ends in EOI (deliver).
+        let length = (640 * 480 * 3 / 2u64).next_multiple_of(ALIGN);
+        assert_eq!((get(&event(0), 0), get(&event(0), 8), get(&event(0), 16)), (EVT_DQBUF, 0, length as u32));
         assert_eq!(device.state.lock().unwrap().region.read(0, gray.len()), gray);
+        assert_eq!(device.state.lock().unwrap().region.read(length - 2, 2), [0xff, 0xd9]);
 
         // The Mac's frame of the stream's size comes next (in the buffer
         // left, or in the first once the HAL queues it again).
@@ -1134,7 +1158,12 @@ mod tests {
         let first = ioctl(&mut device, &mut call, VIDIOC_QUERYBUF, &sized(&[0, BUF_TYPE_VIDEO_CAPTURE], BUFFER_SIZE));
         ioctl(&mut device, &mut call, VIDIOC_QBUF, &first);
         let mac = loop {
-            let found = (0..16).map(event).find(|e| get(e, 0) == EVT_DQBUF && get(e, 16) == 5);
+            // The Mac's (not a JPEG jpeg.rs can rewrite: it goes as it came).
+            let state = device.state.lock().unwrap();
+            let found = (0..16).map(event).find(|e| {
+                get(e, 0) == EVT_DQBUF && state.region.read(u64::from_le_bytes(e[8 + 64..8 + 72].try_into().unwrap()), 5) == b"\xff\xd8mac"
+            });
+            drop(state);
             if let Some(found) = found {
                 break found;
             }
