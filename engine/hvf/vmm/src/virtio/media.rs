@@ -504,27 +504,17 @@ impl State {
     /// Hands `jpeg` to the guest in its oldest queued buffer and returns
     /// that buffer's index; None when it has none queued (it has not given
     /// the last ones back yet), and the frame goes.
-    ///
-    /// Every frame says it fills its whole buffer, which ends in EOI: the
-    /// JPEG is at the start, and what lies between is the rest of older
-    /// frames, which a decoder never reaches (it stops at the JPEG's own
-    /// EOI). With `bytesused` the JPEG's own length, Android's camera HAL
-    /// rejected about half of a movie's frames, all of them whole (frames of
-    /// one size, the gray ones, it read): as if it took a length an older
-    /// frame in the same buffer had, cutting off each frame larger than it.
-    /// A length that never changes cannot be an older one.
     fn deliver(&mut self, id: u32, jpeg: &[u8]) -> Option<usize> {
         let session = self.sessions.get_mut(&id).filter(|s| s.streaming)?;
         let &index = session.queue.front()?;
         let buffer = &mut session.buffers[index];
-        if jpeg.len() + 2 > buffer.length as usize {
+        if jpeg.len() > buffer.length as usize {
             return None;
         }
         session.queue.pop_front();
         self.region.write(buffer.offset, jpeg);
-        self.region.write(buffer.offset + buffer.length as u64 - 2, &[0xff, 0xd9]);
         buffer.queued = false;
-        buffer.bytesused = buffer.length;
+        buffer.bytesused = jpeg.len() as u32;
         session.sequence = session.sequence.wrapping_add(1);
         let mut event = vec![0u8; EVENT_SIZE];
         put(&mut event, 0, EVT_DQBUF);
@@ -991,10 +981,8 @@ mod tests {
         let (session, event) = &state.events[1];
         assert_eq!((*session, event.len()), (id, EVENT_SIZE));
         assert_eq!((get(event, 0), get(event, 4)), (EVT_DQBUF, id));
-        // The v4l2_buffer: index, bytesused (the whole buffer, ending in
-        // EOI), sequence, memory, offset.
-        assert_eq!((get(event, 8), get(event, 16), get(event, 8 + 56), get(event, 8 + 60)), (1, length as u32, 2, MEMORY_MMAP));
-        assert_eq!(state.region.read(buffers[1].0 + length - 2, 2), [0xff, 0xd9]);
+        // The v4l2_buffer: index, bytesused, sequence, memory, offset.
+        assert_eq!((get(event, 8), get(event, 16), get(event, 8 + 56), get(event, 8 + 60)), (1, 8, 2, MEMORY_MMAP));
         assert_eq!(u64::from_le_bytes(event[8 + 64..8 + 72].try_into().unwrap()), buffers[1].0);
 
         // Too big for a buffer: left out, the buffer stays queued.
@@ -1145,11 +1133,8 @@ mod tests {
             event
         };
         let gray = camera::gray_jpeg(640, 480, 128);
-        // Every frame fills its whole buffer, which ends in EOI (deliver).
-        let length = (640 * 480 * 3 / 2u64).next_multiple_of(ALIGN);
-        assert_eq!((get(&event(0), 0), get(&event(0), 8), get(&event(0), 16)), (EVT_DQBUF, 0, length as u32));
+        assert_eq!((get(&event(0), 0), get(&event(0), 8), get(&event(0), 16)), (EVT_DQBUF, 0, gray.len() as u32));
         assert_eq!(device.state.lock().unwrap().region.read(0, gray.len()), gray);
-        assert_eq!(device.state.lock().unwrap().region.read(length - 2, 2), [0xff, 0xd9]);
 
         // The Mac's frame of the stream's size comes next (in the buffer
         // left, or in the first once the HAL queues it again).
