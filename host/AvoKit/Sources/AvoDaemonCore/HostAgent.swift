@@ -4063,23 +4063,3 @@ extension HostAgent {
         return GuestScreenLock.state(output).keyguardLocked ?? true
     }
 }
-
-// MARK: - Cameras (CameraServiceStats)
-
-extension HostAgent {
-    /// cameraserver's account of the streams apps have open, while a
-    /// camera the Mac feeds streams (VMMEngine logs their frame rates).
-    func cameraServiceDump() async throws -> String {
-        try await shell("dumpsys media.camera", timeout: .seconds(5))
-    }
-
-    /// Android's busiest threads just now (CameraServiceStats.busiestThreads).
-    func threadLoad() async throws -> String {
-        try await shell(CameraServiceStats.threadLoadCommand, timeout: .seconds(6))
-    }
-
-    /// Android's warnings and errors since `since` (AndroidWarnings).
-    func androidWarnings(since: String?) async throws -> String {
-        try await shell(AndroidWarnings.command(since: since), timeout: .seconds(5))
-    }
-}

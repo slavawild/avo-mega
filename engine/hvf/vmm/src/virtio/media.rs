@@ -642,8 +642,8 @@ fn stream(shared: Arc<Mutex<State>>, hub: &'static Hub, camera: usize, id: u32, 
             }
         };
         let delivered = shared.lock().unwrap().deliver(id, &jpeg);
-        if let Some(index) = delivered {
-            stats.took(index, &jpeg);
+        if delivered.is_some() {
+            stats.taken += 1;
         } else if new {
             // No buffer queued now: it goes at the next frame time.
             fresh = Some(jpeg);
@@ -670,51 +670,18 @@ struct StreamStats {
     no_buffer: u32,
     /// The last frame (or gray) again, none newer having come.
     repeated: u32,
-    /// The buffers frames went into (bit per index).
-    buffers: u32,
-    /// What the JPEGs taken say of themselves (camera::jpeg_kind), how many each.
-    kinds: BTreeMap<String, u32>,
-    /// The smallest and largest JPEG taken, in bytes.
-    smallest: usize,
-    largest: usize,
-    /// JPEGs taken over 64, 128, 256 and 512 KiB.
-    over: [u32; 4],
 }
 
 impl StreamStats {
-    /// A frame went to Android in buffer `index`.
-    fn took(&mut self, index: usize, jpeg: &[u8]) {
-        self.taken += 1;
-        self.buffers |= 1 << index.min(31);
-        *self.kinds.entry(camera::jpeg_kind(jpeg)).or_default() += 1;
-        self.smallest = if self.taken == 1 { jpeg.len() } else { self.smallest.min(jpeg.len()) };
-        self.largest = self.largest.max(jpeg.len());
-        for (i, limit) in [64usize, 128, 256, 512].iter().enumerate() {
-            if jpeg.len() > limit << 10 {
-                self.over[i] += 1;
-            }
-        }
-    }
-
     /// `camerastats <index> <w>x<h> <fps> fed <n>/s taken <n>/s no-buffer
-    /// <n>/s repeated <n>/s`, then what the JPEGs taken were: in how many
-    /// buffers, their kinds, sizes, and how many a second were large.
+    /// <n>/s repeated <n>/s`.
     fn line(&self, camera: usize, format: Format, over: Duration) -> String {
         let rate = |n: u32| n as f64 / over.as_secs_f64().max(0.001);
-        let mut line = format!(
+        format!(
             "camerastats {camera} {}x{} {} fed {:.1}/s taken {:.1}/s no-buffer {:.1}/s repeated {:.1}/s",
             format.width, format.height, format.fps,
             rate(self.fed), rate(self.taken), rate(self.no_buffer), rate(self.repeated)
-        );
-        if self.taken > 0 {
-            let kinds: Vec<String> = self.kinds.iter().map(|(kind, n)| format!("{kind} {:.1}/s", rate(*n))).collect();
-            line += &format!(
-                "; jpeg in {} buffers: {}; {}-{} KiB, over 64/128/256/512 KiB {:.1}/{:.1}/{:.1}/{:.1} a second",
-                self.buffers.count_ones(), kinds.join(", "), self.smallest >> 10, self.largest >> 10,
-                rate(self.over[0]), rate(self.over[1]), rate(self.over[2]), rate(self.over[3])
-            );
-        }
-        line
+        )
     }
 }
 

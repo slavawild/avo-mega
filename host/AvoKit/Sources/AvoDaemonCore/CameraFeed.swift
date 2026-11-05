@@ -114,10 +114,10 @@ public final class CameraFeed: @unchecked Sendable {
 
     /// A line of avo-vmm's event stream (others are ignored). How a stream
     /// went inside Android (`camerastats`, avo-vmm's virtio/media.rs) goes
-    /// to the log beside what the Mac sent.
+    /// to the log, at debug level, beside what the Mac sent.
     public func handle(_ line: String) {
         if line.hasPrefix("camerastats ") {
-            logger.notice("\(line, privacy: .public)")
+            logger.debug("\(line, privacy: .public)")
             return
         }
         guard let event = Self.parse(line) else { return }
@@ -667,7 +667,7 @@ final class FileVideoCamera: CameraProducer, @unchecked Sendable {
         let fps = String(format: "%.1f", Double(stats.sent) / seconds), newFPS = String(format: "%.1f", Double(stats.encoded) / seconds)
         let decodeMs = ms(stats.decode, stats.encoded), encodeMs = ms(stats.encode, stats.encoded)
         let asked = "\(request.fps) fps at \(request.width)×\(request.height)"
-        logger.notice("camera video: \(fps, privacy: .public) fps sent (\(newFPS, privacy: .public) new) for \(asked, privacy: .public); decode \(decodeMs, privacy: .public) ms, encode \(encodeMs, privacy: .public) ms a frame")
+        logger.debug("camera video: \(fps, privacy: .public) fps sent (\(newFPS, privacy: .public) new) for \(asked, privacy: .public); decode \(decodeMs, privacy: .public) ms, encode \(encodeMs, privacy: .public) ms a frame")
         stats = (0, 0, .zero, .zero)
         statsSince = now
     }
