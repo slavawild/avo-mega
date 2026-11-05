@@ -594,8 +594,16 @@ fn stream(shared: Arc<Mutex<State>>, hub: &'static Hub, camera: usize, id: u32, 
                 stats.no_buffer += 1;
             }
             stats.fed += 1;
-            last = Some((frame.jpeg.clone(), Instant::now()));
-            fresh = Some(frame.jpeg);
+            // As a plain baseline JPEG, which the camera HAL reads whole (jpeg.rs).
+            let jpeg = match crate::jpeg::baseline(&frame.jpeg) {
+                Some(plain) => Arc::new(plain),
+                None => {
+                    stats.as_is += 1;
+                    frame.jpeg
+                }
+            };
+            last = Some((jpeg.clone(), Instant::now()));
+            fresh = Some(jpeg);
             if stop.load(Ordering::Acquire) {
                 return;
             }
@@ -643,6 +651,8 @@ struct StreamStats {
     no_buffer: u32,
     /// The last frame (or gray) again, none newer having come.
     repeated: u32,
+    /// New frames jpeg::baseline could not rewrite: they went as they came.
+    as_is: u32,
     /// The buffers frames went into (bit per index).
     buffers: u32,
     /// What the JPEGs taken say of themselves (camera::jpeg_kind), how many each.
@@ -670,14 +680,14 @@ impl StreamStats {
     }
 
     /// `camerastats <index> <w>x<h> <fps> fed <n>/s taken <n>/s no-buffer
-    /// <n>/s repeated <n>/s`, then what the JPEGs taken were: in how many
+    /// <n>/s repeated <n>/s not-rewritten <n>/s`, then what the JPEGs taken were: in how many
     /// buffers, their kinds, sizes, and how many a second were large.
     fn line(&self, camera: usize, format: Format, over: Duration) -> String {
         let rate = |n: u32| n as f64 / over.as_secs_f64().max(0.001);
         let mut line = format!(
-            "camerastats {camera} {}x{} {} fed {:.1}/s taken {:.1}/s no-buffer {:.1}/s repeated {:.1}/s",
+            "camerastats {camera} {}x{} {} fed {:.1}/s taken {:.1}/s no-buffer {:.1}/s repeated {:.1}/s not-rewritten {:.1}/s",
             format.width, format.height, format.fps,
-            rate(self.fed), rate(self.taken), rate(self.no_buffer), rate(self.repeated)
+            rate(self.fed), rate(self.taken), rate(self.no_buffer), rate(self.repeated), rate(self.as_is)
         );
         if self.taken > 0 {
             let kinds: Vec<String> = self.kinds.iter().map(|(kind, n)| format!("{kind} {:.1}/s", rate(*n))).collect();
