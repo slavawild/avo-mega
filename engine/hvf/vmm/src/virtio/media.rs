@@ -556,74 +556,80 @@ impl State {
     }
 }
 
-/// Feeds streaming session `id` until `stop`: each new frame of its size as
-/// it comes; without one for two frame times the last again (for STALE),
-/// or gray. A frame that finds no buffer queued (Android has not given the
-/// last ones back yet) waits for one, tried again every `RETRY`, until a
-/// newer frame takes its place: the Mac's 30 a second and Android's
-/// buffers keep their own time, and a frame missed by a hair is not lost.
+/// Feeds streaming session `id` until `stop`, on the stream's own clock as a
+/// sensor would: every frame time exactly, the newest frame of its size
+/// that came since the last one, else the last again (for STALE), or gray.
+/// Frames come from the Mac unevenly (their encoding takes a varying few
+/// milliseconds), and Android's camera HAL stamps each with the moment it
+/// dequeues it: handed over as they came, recordings saw frames closer
+/// than a frame time apart and dropped about every other one (about 18 of
+/// 30 a second), while previews showed all 30. A frame that finds no buffer
+/// queued goes at the next frame time, unless a newer one has come.
 /// Every few seconds the subscribers hear how it went
 /// (`camerastats`): frames that came from the Mac, frames Android took,
-/// frames that went because Android had no buffer queued, and repeats.
+/// frames Android never saw, and repeats.
 fn stream(shared: Arc<Mutex<State>>, hub: &'static Hub, camera: usize, id: u32, format: Format, stop: Arc<AtomicBool>) {
     let interval = Duration::from_secs(1) / format.fps.max(1);
     let gray = Arc::new(camera::gray_jpeg(format.width, format.height, 128));
-    let (mut seen, mut last, mut due) = (0, None::<(Arc<Vec<u8>>, Instant)>, Instant::now());
+    let mut seen = 0;
+    // The last frame from the Mac, and when it came (for STALE).
+    let mut last: Option<(Arc<Vec<u8>>, Instant)> = None;
+    // A newer frame than the last one handed over, waiting for its time.
+    let mut fresh: Option<Arc<Vec<u8>>> = None;
+    let mut next = Instant::now() + interval;
     let mut stats = StreamStats::default();
     let mut reported = Instant::now();
-    // A frame that found no buffer queued, to hand over once one is.
-    let mut pending: Option<Arc<Vec<u8>>> = None;
     while !stop.load(Ordering::Acquire) {
         if reported.elapsed() >= STATS_INTERVAL {
             hub.report(stats.line(camera, format, reported.elapsed()));
             stats = StreamStats::default();
             reported = Instant::now();
         }
-        let until = if pending.is_some() { (Instant::now() + RETRY).min(due) } else { due };
-        let fresh = hub.wait(camera, seen, until);
-        let now = Instant::now();
-        let jpeg = match fresh {
-            Some((sequence, frame)) => {
-                seen = sequence;
-                if (frame.width, frame.height) != (format.width, format.height) {
-                    continue;
-                }
-                // The one before never found a buffer: this one replaces it.
-                if pending.take().is_some() {
-                    stats.no_buffer += 1;
-                }
-                stats.fed += 1;
-                last = Some((frame.jpeg.clone(), now));
-                due = now + interval * 2;
-                frame.jpeg
+        // Until the next frame time, keep the newest frame that comes.
+        while let Some((sequence, frame)) = hub.wait(camera, seen, next) {
+            seen = sequence;
+            if (frame.width, frame.height) != (format.width, format.height) {
+                continue;
             }
-            None if pending.is_some() && now < due => pending.take().unwrap(),
-            None => {
-                if pending.take().is_some() {
-                    stats.no_buffer += 1;
-                }
-                due = now + interval;
-                stats.repeated += 1;
-                match &last {
-                    Some((jpeg, at)) if now - *at < camera::STALE => jpeg.clone(),
-                    _ => gray.clone(),
-                }
+            if fresh.is_some() {
+                // Superseded before its time: Android never sees it.
+                stats.no_buffer += 1;
             }
-        };
-        let mut state = shared.lock().unwrap();
+            stats.fed += 1;
+            last = Some((frame.jpeg.clone(), Instant::now()));
+            fresh = Some(frame.jpeg);
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+        }
         if stop.load(Ordering::Acquire) {
             return;
         }
-        if state.deliver(id, &jpeg) {
+        let now = Instant::now();
+        let (jpeg, new) = match fresh.take() {
+            Some(jpeg) => (jpeg, true),
+            None => {
+                stats.repeated += 1;
+                match &last {
+                    Some((jpeg, at)) if now - *at < camera::STALE => (jpeg.clone(), false),
+                    _ => (gray.clone(), false),
+                }
+            }
+        };
+        let delivered = shared.lock().unwrap().deliver(id, &jpeg);
+        if delivered {
             stats.taken += 1;
-        } else {
-            pending = Some(jpeg);
+        } else if new {
+            // No buffer queued now: it goes at the next frame time.
+            fresh = Some(jpeg);
+        }
+        // The next frame time; after a stall (a paused Mac), from now.
+        next += interval;
+        if next + interval < now {
+            next = now + interval;
         }
     }
 }
-
-/// How soon a frame that found no buffer queued is tried again.
-const RETRY: Duration = Duration::from_millis(2);
 
 /// How often a stream reports (`camerastats`).
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
@@ -634,7 +640,8 @@ struct StreamStats {
     fed: u32,
     /// Frames (new or repeated) Android took.
     taken: u32,
-    /// Frames that went: Android had no buffer queued before a newer one came.
+    /// Frames Android never saw: a newer one came before their frame time
+    /// or before Android had a buffer queued for them.
     no_buffer: u32,
     /// The last frame (or gray) again, none newer having come.
     repeated: u32,
