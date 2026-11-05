@@ -40,8 +40,7 @@ if [ "$mode" = compare ]; then
     fi
   done
   echo "Focused camera characteristics (Avo vs phone):"
-  diff -u --label "Avo: $left" --label "Phone: $right" \
-    "$left/characteristics-focus.txt" "$right/characteristics-focus.txt" || true
+  diff -u "$left/characteristics-focus.txt" "$right/characteristics-focus.txt" || true
   echo
   echo "Full CameraService dumps:"
   printf '  %s\n  %s\n' "$left/camera-before.txt" "$right/camera-before.txt"
