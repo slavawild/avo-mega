@@ -170,7 +170,7 @@ import IOSurface
     func shakeDevice(reply: @escaping @Sendable (NSError?) -> Void)
     /// Where a camera's movie is (an encoded CameraVideoSeek in, an encoded
     /// CameraVideoPlayback out, nil when the camera shows no movie), moving
-    /// it to the second the request names first.
+    /// it to the second, and pausing or playing it, as the request says first.
     func cameraVideoPlayback(_ request: Data, reply: @escaping @Sendable (Data?, NSError?) -> Void)
     /// Android's media volume (AndroidVolume), every app's.
     func androidVolume(reply: @escaping @Sendable (Data?, NSError?) -> Void)

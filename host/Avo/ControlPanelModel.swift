@@ -1106,11 +1106,11 @@ final class ControlPanelModel {
     @ObservationIgnored private var volumeSending = false
 
     /// Where camera `camera`'s movie is (0 back, 1 front), after moving it
-    /// to `seconds` into it when given; nil when it shows no movie, or
-    /// Android is not running (Settings › Devices › Cameras).
-    func cameraVideoPlayback(camera: Int, seekTo seconds: Double? = nil) async -> CameraVideoPlayback? {
+    /// to `seconds` into it and pausing or playing it, when given; nil when
+    /// it shows no movie, or Android is not running (Settings › Devices › Cameras).
+    func cameraVideoPlayback(camera: Int, seekTo seconds: Double? = nil, paused: Bool? = nil) async -> CameraVideoPlayback? {
         guard let client, status.state == .running else { return nil }
-        return try? await client.cameraVideoPlayback(camera: camera, seekTo: seconds)
+        return try? await client.cameraVideoPlayback(camera: camera, seekTo: seconds, paused: paused)
     }
 
     func loadAndroidVolume() async {

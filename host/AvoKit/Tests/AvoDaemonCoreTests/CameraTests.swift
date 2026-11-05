@@ -441,6 +441,20 @@ import UniformTypeIdentifiers
         try await Task.sleep(for: .milliseconds(250))
         #expect(colors().contains("red"), "moved into the first half: \(colors())")
         #expect(camera.seek(to: 50).position < 1, "no further than its end")
+        // Paused, it stays where it is, its frame sent again and again.
+        _ = camera.seek(to: 0.1)
+        try await Task.sleep(for: .milliseconds(100))
+        camera.setPaused(true)
+        let held = camera.playback()
+        #expect(held.paused)
+        frames.lock.withLock { frames.all = [] }
+        try await Task.sleep(for: .milliseconds(700))
+        #expect(camera.playback().position == held.position, "a paused movie does not move")
+        #expect(!colors().isEmpty && !colors().contains("blue"), "still in its red half: \(colors())")
+        // Moved while paused, it stays paused there; played, it goes on.
+        #expect(camera.seek(to: 0.7).paused)
+        camera.setPaused(false)
+        #expect(!camera.playback().paused)
         camera.stop()
     }
 
@@ -553,7 +567,7 @@ import UniformTypeIdentifiers
         }
         let starts = Starts()
         let path = FileManager.default.temporaryDirectory.appending(path: "avo-cam-\(UUID().uuidString.prefix(8)).sock").path
-        let feed = CameraFeed(socketPath: path, sources: [.none, .video("/nonexistent/a.mp4")]) { camera, _ in
+        let feed = CameraFeed(socketPath: path, sources: [.none, .video("/nonexistent/a.mp4")]) { camera, _, _ in
             starts.lock.withLock { starts.cameras.append(camera) }
         }
         feed.handle("camera 1 on 320 240 15")

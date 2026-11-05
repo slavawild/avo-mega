@@ -425,13 +425,16 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
         await agent.sampleProcesses(lock.withLock { processSink })
         // Settings › Devices › Cameras: the Mac's cameras, or scenes, while Android streams them.
         let cameras = launch.config.cameraFlags.isEmpty ? nil : CameraFeed(socketPath: controlPath, sources: launch.config.cameraSources,
-                                                                               framing: launch.config.cameraVideoFraming) { [weak self] camera, seconds in
-            // The movie starts (from its beginning, or where it was moved)
-            // or moves: its soundtrack, when it is the microphone, goes
-            // there with it. Not awaited: commands go one at a time, and the
-            // camera feed must not wait on them.
+                                                                               framing: launch.config.cameraVideoFraming) { [weak self] camera, seconds, paused in
+            // The movie starts (from its beginning, or where it was moved),
+            // moves, pauses or plays on: its soundtrack, when it is the
+            // microphone, does too. Not awaited: commands go one at a time,
+            // and the camera feed must not wait on them.
             guard let self, camera == self.lock.withLock({ self.soundtrackCamera }) else { return }
-            Task { try? await control.send(Self.soundtrackSyncCommand(seconds)) }
+            Task {
+                try? await control.send(Self.soundtrackSyncCommand(seconds))
+                try? await control.send(paused ? "microphone pause" : "microphone play")
+            }
         }
         let events = try control.events()
         let pump = Task {
@@ -1060,9 +1063,9 @@ extension VMMEngine: ActivityEngine {
 
 /// Settings › Devices › Cameras: where a camera's movie is, and moving it.
 extension VMMEngine: CameraVideoEngine {
-    func cameraVideoPlayback(camera: Int, seekTo seconds: Double?) async -> CameraVideoPlayback? {
+    func cameraVideoPlayback(camera: Int, seekTo seconds: Double?, paused: Bool?) async -> CameraVideoPlayback? {
         let cameras = lock.withLock { self.cameras }
-        // Its soundtrack follows a move through CameraFeed's videoStarted.
-        return cameras?.videoPlayback(camera: camera, seekTo: seconds)
+        // Its soundtrack follows a move or a pause through CameraFeed's videoStarted.
+        return cameras?.videoPlayback(camera: camera, seekTo: seconds, paused: paused)
     }
 }

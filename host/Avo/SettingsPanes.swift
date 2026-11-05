@@ -1281,9 +1281,10 @@ struct CameraPicker: View {
     }
 }
 
-/// Where the movie a camera shows has got to, and a slider that moves it
-/// (CameraVideoPlayback): followed twice a second while the row shows.
-/// While no app uses the camera, a moved movie starts there the next time.
+/// Where the movie a camera shows has got to, a slider that moves it, and
+/// buttons that start it over and pause or play it (CameraVideoPlayback):
+/// followed twice a second while the row shows. While no app uses the
+/// camera, a moved or paused movie starts there, and so, the next time.
 struct VideoPlaybackControls: View {
     @Environment(ControlPanelModel.self) private var model
     let camera: Int
@@ -1304,6 +1305,15 @@ struct VideoPlaybackControls: View {
             }
             .buttonStyle(.borderless)
             .help(Text("From the beginning"))
+            Button {
+                Task { await setPaused(!(playback?.paused ?? false)) }
+            } label: {
+                Image(systemName: playback?.paused == true ? "play.fill" : "pause.fill")
+                    .frame(width: 14)
+            }
+            .buttonStyle(.borderless)
+            .help(playback?.paused == true ? Text("Play") : Text("Pause"))
+            .accessibilityLabel(playback?.paused == true ? Text("Play") : Text("Pause"))
             HazeSlider(value: Binding(get: { draft ?? playback?.position ?? 0 }, set: { value in
                 // Dragged: on release. Moved a step (VoiceOver): at once.
                 if draft != nil { draft = value } else { Task { await seek(value) } }
@@ -1341,7 +1351,9 @@ struct VideoPlaybackControls: View {
         if model.status.state != .running {
             Text("The slider moves the video while Android is running.")
         } else if playback?.playing == false {
-            Text("The video plays while an app uses this camera; moved here, it starts from that moment.")
+            Text("The video plays while an app uses this camera; moved or paused here, it starts from that moment, or waits there.")
+        } else if playback?.paused == true {
+            Text("Paused: the camera shows this moment until you play the video again; its sound, as the microphone, is silent.")
         } else {
             Text("Drag to move the video to any moment; its sound, as the microphone, goes with it.")
         }
@@ -1349,6 +1361,10 @@ struct VideoPlaybackControls: View {
 
     private func seek(_ seconds: Double) async {
         if let moved = await model.cameraVideoPlayback(camera: camera, seekTo: seconds) { playback = moved }
+    }
+
+    private func setPaused(_ paused: Bool) async {
+        if let now = await model.cameraVideoPlayback(camera: camera, paused: paused) { playback = now }
     }
 
     /// "1:05" for 65 seconds.

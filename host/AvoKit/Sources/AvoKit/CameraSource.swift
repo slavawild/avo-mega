@@ -184,29 +184,35 @@ extension VMConfig {
 
 /// Where the movie a camera shows has got to (Settings › Devices ›
 /// Cameras, DaemonClient.cameraVideoPlayback): `position` seconds into
-/// its `duration`. Not `playing` while no Android app uses the camera:
-/// `position` is then where it starts the next time.
+/// its `duration`, and whether it is `paused` there. Not `playing` while
+/// no Android app uses the camera: `position` is then where it starts the
+/// next time (and `paused`, whether it waits there).
 public struct CameraVideoPlayback: Codable, Hashable, Sendable {
     public var playing: Bool
     public var position: Double
     /// Nil until the movie has loaded (only while it plays).
     public var duration: Double?
+    public var paused: Bool
 
-    public init(playing: Bool, position: Double, duration: Double?) {
+    public init(playing: Bool, position: Double, duration: Double?, paused: Bool = false) {
         self.playing = playing
         self.position = position
         self.duration = duration
+        self.paused = paused
     }
 }
 
-/// A request for `CameraVideoPlayback`: camera 0 (back) or 1 (front), and
-/// the second of its movie to go to, or nil to ask only.
+/// A request for `CameraVideoPlayback`: camera 0 (back) or 1 (front), the
+/// second of its movie to go to, and whether to pause or play it; nil
+/// for either leaves it as it is.
 public struct CameraVideoSeek: Codable, Hashable, Sendable {
     public var camera: Int
     public var seconds: Double?
+    public var paused: Bool?
 
-    public init(camera: Int, seconds: Double?) {
+    public init(camera: Int, seconds: Double?, paused: Bool? = nil) {
         self.camera = camera
         self.seconds = seconds
+        self.paused = paused
     }
 }

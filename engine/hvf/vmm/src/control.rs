@@ -35,6 +35,8 @@
 //!                                     48 kHz stereo S16LE PCM soundtrack
 //! microphone sync [seconds]           start file audio over (or at that second of
 //!                                     the video) with the video camera
+//! microphone pause|play               the video is paused (file audio is silent
+//!                                     and stays where it is) or plays on
 //! tap <x> <y> / swipe <x1> <y1> <x2> <y2> [ms]   pixels of scanout 0 (debugging)
 //! pause                              stop the vCPUs (pause.rs); `ok` once none
 //!                                     runs guest code, an error when one does
@@ -183,14 +185,19 @@ enum Microphone {
     /// `sync [seconds]`: the video camera started its movie over, or
     /// jumped to that second of it; so does its soundtrack.
     Sync(f64),
+    /// `pause` (true) or `play`: the video camera's movie stopped where it
+    /// is, or goes on; its soundtrack, silent meanwhile, with it.
+    Paused(bool),
 }
 
 fn parse_microphone(line: &str) -> Result<Microphone, String> {
-    let usage = || "microphone on|off|mac|sync [seconds]|file <path>".to_string();
+    let usage = || "microphone on|off|mac|pause|play|sync [seconds]|file <path>".to_string();
     let rest = line.trim().strip_prefix("microphone").ok_or_else(usage)?.trim_start();
     let (word, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     match word {
-        "on" | "off" | "mac" if !after.trim().is_empty() => Err(usage()),
+        "on" | "off" | "mac" | "pause" | "play" if !after.trim().is_empty() => Err(usage()),
+        "pause" => Ok(Microphone::Paused(true)),
+        "play" => Ok(Microphone::Paused(false)),
         "on" => Ok(Microphone::Allowed(true)),
         "off" => Ok(Microphone::Allowed(false)),
         "mac" => Ok(Microphone::Mac),
@@ -445,6 +452,7 @@ impl Controls {
                     Microphone::Allowed(allowed) => MICROPHONE.set(allowed),
                     Microphone::Mac => MICROPHONE.set_file(None),
                     Microphone::Sync(seconds) => MICROPHONE.sync_video(seconds),
+                    Microphone::Paused(paused) => MICROPHONE.pause_video(paused),
                     Microphone::File(path) => MICROPHONE.set_file(Some(path)),
                 }
             }
@@ -588,13 +596,15 @@ mod tests {
         assert_eq!(parse_microphone("microphone mac"), Ok(Microphone::Mac));
         assert_eq!(parse_microphone("microphone sync"), Ok(Microphone::Sync(0.0)));
         assert_eq!(parse_microphone("microphone sync 12.5"), Ok(Microphone::Sync(12.5)));
+        assert_eq!(parse_microphone("microphone pause"), Ok(Microphone::Paused(true)));
+        assert_eq!(parse_microphone("microphone play"), Ok(Microphone::Paused(false)));
         // A path keeps its spaces, wherever the command's own spaces fall.
         let path = "/Users/a b/Library/Application Support/Avo/CameraVideos/1/My  clip.pcm";
         assert_eq!(parse_microphone(&format!("microphone file {path}")), Ok(Microphone::File(path.into())));
         assert_eq!(parse_microphone(&format!("  microphone   file   {path}  ")), Ok(Microphone::File(path.into())));
         for line in ["microphone", "microphone file", "microphone file clip.pcm", "microphone file /a/clip.mp4", "microphone file /.pcm",
                      "microphone on now", "microphone loud", "microphones on", "microphone sync -1", "microphone sync soon",
-                     "microphone sync 1 2", "microphone sync inf"] {
+                     "microphone sync 1 2", "microphone sync inf", "microphone pause now"] {
             assert!(parse_microphone(line).is_err(), "{line}");
         }
     }

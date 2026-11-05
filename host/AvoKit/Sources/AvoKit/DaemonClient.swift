@@ -303,9 +303,10 @@ public final class DaemonClient: @unchecked Sendable {
     }
 
     /// Where camera `camera`'s movie is (0 back, 1 front), after moving it to
-    /// `seconds` into it when given; nil when the camera shows no movie.
-    public func cameraVideoPlayback(camera: Int, seekTo seconds: Double? = nil) async throws -> CameraVideoPlayback? {
-        let request = AvoXPC.encode(CameraVideoSeek(camera: camera, seconds: seconds))
+    /// `seconds` into it and pausing or playing it, when given; nil when
+    /// the camera shows no movie.
+    public func cameraVideoPlayback(camera: Int, seekTo seconds: Double? = nil, paused: Bool? = nil) async throws -> CameraVideoPlayback? {
+        let request = AvoXPC.encode(CameraVideoSeek(camera: camera, seconds: seconds, paused: paused))
         let data: Data? = try await call { proxy, done in
             proxy.cameraVideoPlayback(request) { data, error in
                 done(error.map { .failure(AvoXPC.avoError($0)) } ?? .success(data))

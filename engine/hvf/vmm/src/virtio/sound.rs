@@ -414,10 +414,14 @@ impl Drop for PCMVideoMic {
 /// from the start). Off, Android records silence and the microphone is never
 /// opened, so macOS never asks for it; turning it off closes one that is
 /// open. The process's: it lasts through guest reboots.
-pub static MICROPHONE: Microphone = Microphone { allowed: AtomicBool::new(true), file: Mutex::new(None), devices: Mutex::new(Vec::new()) };
+pub static MICROPHONE: Microphone =
+    Microphone { allowed: AtomicBool::new(true), video_paused: AtomicBool::new(false), file: Mutex::new(None), devices: Mutex::new(Vec::new()) };
 
 pub struct Microphone {
     allowed: AtomicBool,
+    /// The video whose soundtrack is the microphone is paused: silence,
+    /// and the soundtrack stays where it is.
+    video_paused: AtomicBool,
     /// Imported video's audio path; selected before recording starts.
     file: Mutex<Option<String>>,
     /// Every machine's sound device, to close its microphone.
@@ -441,6 +445,15 @@ impl Microphone {
                 soundtrack.position = soundtrack.at(seconds);
             }
         }
+    }
+
+    /// The video camera's movie paused (`microphone pause`) or plays on.
+    pub fn pause_video(&self, paused: bool) {
+        self.video_paused.store(paused, Ordering::Release);
+    }
+
+    fn video_paused(&self) -> bool {
+        self.video_paused.load(Ordering::Acquire)
     }
 
     pub fn allowed(&self) -> bool {
@@ -910,7 +923,7 @@ fn record_period(active: &mut Active, stream: &mut Stream, params: Params) {
     let room = chain.writable_len().saturating_sub(STATUS_LEN);
     let needed = if stream.priming { room.max(params.capture_slack_bytes()) } else { room };
     if stream.video_mode {
-        let data = if MICROPHONE.allowed() && !muted() {
+        let data = if MICROPHONE.allowed() && !muted() && !MICROPHONE.video_paused() {
             stream.video_audio.as_mut().map(|audio| audio.render(params, room)).unwrap_or_else(|| vec![0; room])
         } else {
             vec![0; room]
