@@ -4072,4 +4072,9 @@ extension HostAgent {
     func cameraServiceDump() async throws -> String {
         try await shell("dumpsys media.camera", timeout: .seconds(5))
     }
+
+    /// Android's busiest threads just now (CameraServiceStats.busiestThreads).
+    func threadLoad() async throws -> String {
+        try await shell(CameraServiceStats.threadLoadCommand, timeout: .seconds(6))
+    }
 }

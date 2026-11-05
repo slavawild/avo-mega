@@ -209,6 +209,10 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
                             log.notice("\(report, privacy: .public)")
                         }
                         previous = stats
+                        // What Android's CPU is busy with meanwhile: where a slow camera waits.
+                        if let top = try? await agent.threadLoad(), let busiest = CameraServiceStats.busiestThreads(top: top) {
+                            log.notice("\(busiest, privacy: .public)")
+                        }
                     }
                 }
             }

@@ -82,4 +82,30 @@ struct CameraServiceStats: Equatable {
         }
         return parts.isEmpty ? nil : "android streams: " + parts.joined(separator: "; ")
     }
+
+    /// The threads that took the most CPU in the last frame of toybox's
+    /// `top -H -b` (`ThreadLoad.command`): "busiest threads: 85% ExtCamOutThr
+    /// (android.hardware.camera.provider…), …", those at 5% or more; nil
+    /// with none. Which part of Android a slow camera waits on.
+    static func busiestThreads(top output: String, limit: Int = 8) -> String? {
+        let lines = output.split(separator: "\n").map(String.init)
+        // The last frame starts after the last header (it names %CPU).
+        guard let header = lines.lastIndex(where: { $0.contains("%CPU") }) else { return nil }
+        var rows: [(cpu: Double, text: String)] = []
+        for line in lines[(header + 1)...] {
+            // PID USER PR NI VIRT RES SHR S %CPU %MEM TIME+ THREAD PROCESS
+            let fields = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+            guard fields.count >= 12, let cpu = Double(fields[8]), cpu >= 5 else { continue }
+            let thread = fields[11]
+            let process = fields.count > 12 ? fields[12...].joined(separator: " ") : ""
+            rows.append((cpu, process.isEmpty ? thread : "\(thread) (\(process))"))
+        }
+        guard !rows.isEmpty else { return nil }
+        let busiest = rows.sorted { $0.cpu > $1.cpu }.prefix(limit)
+        return "busiest threads: " + busiest.map { "\(Int($0.cpu.rounded()))% \($0.text)" }.joined(separator: ", ")
+    }
+
+    /// Two frames a second apart (the first counts from each thread's
+    /// start), threads by CPU, enough lines for the busiest.
+    static let threadLoadCommand = "top -H -b -n 2 -d 1 -m 40"
 }

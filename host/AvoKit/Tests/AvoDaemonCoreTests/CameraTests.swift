@@ -397,6 +397,23 @@ import Testing
         #expect(b.report(since: a) == "android streams: camera ?/0 640x480 0x23: 30.0 fps; camera ?/0#2 640x480 0x23: 30.0 fps")
     }
 
+    /// toybox top's last frame names the threads Android's CPU is busy with.
+    @Test func androidsBusiestThreadsAreNamed() {
+        let top = """
+        Tasks: 900 total,   1 running, 899 sleeping,   0 stopped,   0 zombie
+          PID USER         PR  NI VIRT  RES  SHR S[%CPU] %MEM     TIME+ THREAD          PROCESS
+         4321 cameraserver 20   0  12G  20M  10M S 50.0   0.5   1:00.00 ExtCamOutThr    android.hardware.camera.provider-ext
+        Tasks: 900 total,   1 running, 899 sleeping,   0 stopped,   0 zombie
+          PID USER         PR  NI VIRT  RES  SHR S[%CPU] %MEM     TIME+ THREAD          PROCESS
+         4321 cameraserver 20   0  12G  20M  10M R 92.0   0.5   1:01.00 ExtCamOutThr    android.hardware.camera.provider-ext
+         5555 u0_a123      10 -10  14G 200M  90M S 41.5   5.0   0:30.00 RenderThread    org.telegram.messenger
+         6666 mediacodec   20   0  10G  15M   8M S  3.0   0.2   0:05.00 C2-avc-enc      media.swcodec
+        """
+        #expect(CameraServiceStats.busiestThreads(top: top)
+                == "busiest threads: 92% ExtCamOutThr (android.hardware.camera.provider-ext), 42% RenderThread (org.telegram.messenger)")
+        #expect(CameraServiceStats.busiestThreads(top: "nothing") == nil)
+    }
+
     /// Phones record portrait movies sideways and say how to turn them.
     @Test func phoneMoviesAreTurnedUpright() {
         #expect(FileVideoCamera.orientation(.identity) == .up)
