@@ -208,13 +208,16 @@ struct Session {
     buffers: Vec<Buffer>,
     /// Queued buffers, oldest first.
     queue: VecDeque<usize>,
+    /// Buffers handed to the guest whose frame Android has not mapped yet,
+    /// oldest first: what CMD_MMAP maps (see there).
+    unmapped: VecDeque<usize>,
     streaming: bool,
     sequence: u32,
 }
 
 impl Session {
     fn new() -> Session {
-        Session { format: Format { width: 1280, height: 720, fps: 30 }, buffers: Vec::new(), queue: VecDeque::new(), streaming: false, sequence: 0 }
+        Session { format: Format { width: 1280, height: 720, fps: 30 }, buffers: Vec::new(), queue: VecDeque::new(), unmapped: VecDeque::new(), streaming: false, sequence: 0 }
     }
 
     /// `struct v4l2_buffer` for buffer `index`.
@@ -269,9 +272,29 @@ impl State {
                 Ok(payload) => response(0, &payload),
                 Err(errno) => response(errno, &[]),
             },
+            // The buffer a mapping is for. The guest driver gives back at
+            // DQBUF the `m` union the app passed at QBUF, not the device's;
+            // Android's camera HAL queues buffers again with a zeroed
+            // v4l2_buffer (enqueueV4l2Frame), so from the second round on
+            // every buffer it dequeues says offset 0, and it mapped buffer
+            // 0 for each: another frame read with this one's length, of
+            // which about half failed to decode ("Convert V4L2 frame to YU12
+            // failed! res 1") and the rest showed an older frame. The HAL
+            // maps each frame once, in the order it dequeues them, which is
+            // the order they were handed over: the oldest frame not mapped
+            // yet is the one, unless the offset names another such frame
+            // (those before it were never mapped). Outside streaming, the
+            // offset says.
             CMD_MMAP => {
                 let (id, offset) = (get(request, 8), get(request, 16) as u64);
-                let found = self.sessions.get(&id).and_then(|s| s.buffers.iter().find(|b| b.offset == offset));
+                let found = self.sessions.get_mut(&id).and_then(|session| {
+                    let named = session.buffers.iter().position(|b| b.offset == offset);
+                    let index = match named.and_then(|i| session.unmapped.iter().position(|&u| u == i)) {
+                        Some(at) if offset != 0 => session.unmapped.drain(..=at).last(),
+                        _ => session.unmapped.pop_front().or(named),
+                    }?;
+                    session.buffers.get(index)
+                });
                 match found {
                     Some(buffer) => {
                         let mut out = response(0, &[0; 16]);
@@ -414,6 +437,8 @@ impl State {
                     session.buffers[index].queued = true;
                     session.buffers[index].bytesused = 0;
                     session.queue.push_back(index);
+                    // Back without its frame mapped (a request that failed early).
+                    session.unmapped.retain(|&i| i != index);
                 }
                 out.copy_from_slice(&session.describe(index));
                 Ok(out)
@@ -485,6 +510,7 @@ impl State {
         if let Some(session) = self.sessions.get_mut(&id) {
             session.streaming = false;
             session.queue.clear();
+            session.unmapped.clear();
             for buffer in &mut session.buffers {
                 buffer.queued = false;
             }
@@ -501,16 +527,18 @@ impl State {
         }
     }
 
-    /// Puts `jpeg` in the oldest queued buffer of streaming session `id`
-    /// and returns it to the driver; no buffer queued, no frame.
-    fn deliver(&mut self, id: u32, jpeg: &[u8]) {
-        let Some(session) = self.sessions.get_mut(&id).filter(|s| s.streaming) else { return };
-        let Some(&index) = session.queue.front() else { return };
+    /// Hands `jpeg` to the guest in its oldest queued buffer and returns
+    /// that buffer's index; None when it has none queued (it has not given
+    /// the last ones back yet), and the frame goes.
+    fn deliver(&mut self, id: u32, jpeg: &[u8]) -> Option<usize> {
+        let session = self.sessions.get_mut(&id).filter(|s| s.streaming)?;
+        let &index = session.queue.front()?;
         let buffer = &mut session.buffers[index];
         if jpeg.len() > buffer.length as usize {
-            return;
+            return None;
         }
         session.queue.pop_front();
+        session.unmapped.push_back(index);
         self.region.write(buffer.offset, jpeg);
         buffer.queued = false;
         buffer.bytesused = jpeg.len() as u32;
@@ -525,6 +553,7 @@ impl State {
             self.events.pop_front();
         }
         self.flush_events();
+        Some(index)
     }
 
     fn flush_events(&mut self) {
@@ -552,39 +581,107 @@ impl State {
     }
 }
 
-/// Feeds streaming session `id` until `stop`: each new frame of its size as
-/// it comes; without one for two frame times the last again (for STALE),
-/// or gray.
+/// Feeds streaming session `id` until `stop`, on the stream's own clock as a
+/// sensor would: every frame time exactly, the newest frame of its size
+/// that came since the last one, else the last again (for STALE), or gray.
+/// Frames come from the Mac unevenly (their encoding takes a varying few
+/// milliseconds), and Android's camera HAL stamps each with the moment it
+/// dequeues it: handed over as they came, recordings saw frames closer
+/// than a frame time apart and dropped about every other one (about 18 of
+/// 30 a second), while previews showed all 30. A frame that finds no buffer
+/// queued goes at the next frame time, unless a newer one has come.
+/// Every few seconds the subscribers hear how it went
+/// (`camerastats`): frames that came from the Mac, frames Android took,
+/// frames Android never saw, and repeats.
 fn stream(shared: Arc<Mutex<State>>, hub: &'static Hub, camera: usize, id: u32, format: Format, stop: Arc<AtomicBool>) {
     let interval = Duration::from_secs(1) / format.fps.max(1);
     let gray = Arc::new(camera::gray_jpeg(format.width, format.height, 128));
-    let (mut seen, mut last, mut due) = (0, None::<(Arc<Vec<u8>>, Instant)>, Instant::now());
+    let mut seen = 0;
+    // The last frame from the Mac, and when it came (for STALE).
+    let mut last: Option<(Arc<Vec<u8>>, Instant)> = None;
+    // A newer frame than the last one handed over, waiting for its time.
+    let mut fresh: Option<Arc<Vec<u8>>> = None;
+    let mut next = Instant::now() + interval;
+    let mut stats = StreamStats::default();
+    let mut reported = Instant::now();
     while !stop.load(Ordering::Acquire) {
-        let fresh = hub.wait(camera, seen, due);
-        let now = Instant::now();
-        let jpeg = match fresh {
-            Some((sequence, frame)) => {
-                seen = sequence;
-                if (frame.width, frame.height) != (format.width, format.height) {
-                    continue;
-                }
-                last = Some((frame.jpeg.clone(), now));
-                due = now + interval * 2;
-                frame.jpeg
+        if reported.elapsed() >= STATS_INTERVAL {
+            hub.report(stats.line(camera, format, reported.elapsed()));
+            stats = StreamStats::default();
+            reported = Instant::now();
+        }
+        // Until the next frame time, keep the newest frame that comes.
+        while let Some((sequence, frame)) = hub.wait(camera, seen, next) {
+            seen = sequence;
+            if (frame.width, frame.height) != (format.width, format.height) {
+                continue;
             }
-            None => {
-                due = now + interval;
-                match &last {
-                    Some((jpeg, at)) if now - *at < camera::STALE => jpeg.clone(),
-                    _ => gray.clone(),
-                }
+            if fresh.is_some() {
+                // Superseded before its time: Android never sees it.
+                stats.no_buffer += 1;
             }
-        };
-        let mut state = shared.lock().unwrap();
+            stats.fed += 1;
+            last = Some((frame.jpeg.clone(), Instant::now()));
+            fresh = Some(frame.jpeg);
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+        }
         if stop.load(Ordering::Acquire) {
             return;
         }
-        state.deliver(id, &jpeg);
+        let now = Instant::now();
+        let (jpeg, new) = match fresh.take() {
+            Some(jpeg) => (jpeg, true),
+            None => {
+                stats.repeated += 1;
+                match &last {
+                    Some((jpeg, at)) if now - *at < camera::STALE => (jpeg.clone(), false),
+                    _ => (gray.clone(), false),
+                }
+            }
+        };
+        let delivered = shared.lock().unwrap().deliver(id, &jpeg);
+        if delivered.is_some() {
+            stats.taken += 1;
+        } else if new {
+            // No buffer queued now: it goes at the next frame time.
+            fresh = Some(jpeg);
+        }
+        // The next frame time; after a stall (a paused Mac), from now.
+        next += interval;
+        if next + interval < now {
+            next = now + interval;
+        }
+    }
+}
+
+/// How often a stream reports (`camerastats`).
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct StreamStats {
+    /// New frames from the Mac.
+    fed: u32,
+    /// Frames (new or repeated) Android took.
+    taken: u32,
+    /// Frames Android never saw: a newer one came before their frame time
+    /// or before Android had a buffer queued for them.
+    no_buffer: u32,
+    /// The last frame (or gray) again, none newer having come.
+    repeated: u32,
+}
+
+impl StreamStats {
+    /// `camerastats <index> <w>x<h> <fps> fed <n>/s taken <n>/s no-buffer
+    /// <n>/s repeated <n>/s`.
+    fn line(&self, camera: usize, format: Format, over: Duration) -> String {
+        let rate = |n: u32| n as f64 / over.as_secs_f64().max(0.001);
+        format!(
+            "camerastats {camera} {}x{} {} fed {:.1}/s taken {:.1}/s no-buffer {:.1}/s repeated {:.1}/s",
+            format.width, format.height, format.fps,
+            rate(self.fed), rate(self.taken), rate(self.no_buffer), rate(self.repeated)
+        )
     }
 }
 
@@ -852,8 +949,8 @@ mod tests {
         // S_FMT may not change a streaming session.
         assert_eq!(ioctl(&mut state, id, VIDIOC_S_FMT, &sized(&[BUF_TYPE_VIDEO_CAPTURE, 0, 640, 480], 208)).0, EBUSY);
 
-        state.deliver(id, b"\xff\xd8first");
-        state.deliver(id, b"\xff\xd8second");
+        state.deliver(id, b"\xff\xd8first").unwrap();
+        state.deliver(id, b"\xff\xd8second").unwrap();
         assert_eq!(state.region.read(buffers[0].0, 7), b"\xff\xd8first");
         assert_eq!(state.region.read(buffers[1].0, 8), b"\xff\xd8second");
         let (session, event) = &state.events[1];
@@ -878,6 +975,42 @@ mod tests {
         assert_eq!(ioctl(&mut state, id, VIDIOC_REQBUFS, &sized(&[0, BUF_TYPE_VIDEO_CAPTURE, MEMORY_MMAP], 20)).0, 0);
         assert!(state.command(&cmd(&[CMD_CLOSE, 0, id, 0])).is_empty());
         assert!(state.sessions.is_empty());
+    }
+
+    #[test]
+    fn mappings_follow_the_frames_handed_over() {
+        let mut state = state(true);
+        let id = open(&mut state);
+        let buffers = queue_buffers(&mut state, id, 4);
+        let qbuf = |state: &mut State, index: u32| {
+            // As Android's camera HAL queues a buffer again: index, type, memory; no offset.
+            ioctl(state, id, VIDIOC_QBUF, &sized(&[index, BUF_TYPE_VIDEO_CAPTURE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, MEMORY_MMAP], BUFFER_SIZE)).0
+        };
+        let map = |state: &mut State, offset: u64| {
+            let reply = state.command(&cmd(&[CMD_MMAP, 0, id, 0, offset as u32]));
+            assert_eq!(get(&reply, 0), 0);
+            u64::from_le_bytes(reply[8..16].try_into().unwrap())
+        };
+        assert_eq!(ioctl(&mut state, id, VIDIOC_STREAMON, &cmd(&[BUF_TYPE_VIDEO_CAPTURE])).0, 0);
+        for frame in 0..3 {
+            assert_eq!(state.deliver(id, b"\xff\xd8frame"), Some(frame));
+        }
+        // The first round names its offsets (from QUERYBUF).
+        assert_eq!(map(&mut state, buffers[0].0), buffers[0].0);
+        assert_eq!(qbuf(&mut state, 0), 0);
+        // Later ones say 0: the oldest frame not mapped yet.
+        assert_eq!(map(&mut state, 0), buffers[1].0);
+        assert_eq!(map(&mut state, buffers[2].0), buffers[2].0);
+        assert_eq!(state.deliver(id, b"\xff\xd8frame"), Some(3));
+        assert_eq!(state.deliver(id, b"\xff\xd8frame"), Some(0));
+        assert_eq!(map(&mut state, 0), buffers[3].0);
+        // A buffer back without its frame mapped is not mapped later.
+        assert_eq!((qbuf(&mut state, 1), qbuf(&mut state, 2)), (0, 0));
+        assert_eq!(state.deliver(id, b"\xff\xd8frame"), Some(1));
+        assert_eq!(qbuf(&mut state, 0), 0);
+        assert_eq!(map(&mut state, 0), buffers[1].0);
+        // With no frame waiting, the offset says.
+        assert_eq!(map(&mut state, buffers[2].0), buffers[2].0);
     }
 
     #[test]
@@ -1021,7 +1154,12 @@ mod tests {
         let first = ioctl(&mut device, &mut call, VIDIOC_QUERYBUF, &sized(&[0, BUF_TYPE_VIDEO_CAPTURE], BUFFER_SIZE));
         ioctl(&mut device, &mut call, VIDIOC_QBUF, &first);
         let mac = loop {
-            let found = (0..16).map(event).find(|e| get(e, 0) == EVT_DQBUF && get(e, 16) == 5);
+            // The Mac's (not a JPEG jpeg.rs can rewrite: it goes as it came).
+            let state = device.state.lock().unwrap();
+            let found = (0..16).map(event).find(|e| {
+                get(e, 0) == EVT_DQBUF && state.region.read(u64::from_le_bytes(e[8 + 64..8 + 72].try_into().unwrap()), 5) == b"\xff\xd8mac"
+            });
+            drop(state);
             if let Some(found) = found {
                 break found;
             }

@@ -241,9 +241,13 @@ struct ProxyChipInNetsim {
         try await android.command(HCIOpcode.leSetScanEnable, [0x00, 0x00])
 
         // Connect to the proxy's random address.
-        try await android.command(HCIOpcode.leCreateConnection,
-                                  le16(0x0010) + le16(0x0010) + [0x00, 0x01] + proxy.address
-                                  + [0x00] + le16(0x0018) + le16(0x0028) + le16(0) + le16(0x0100) + le16(0) + le16(0))
+        // Built in steps: as one expression it was too much for some compilers' type checker.
+        var connect: [UInt8] = le16(0x0010) + le16(0x0010)
+        connect += [0x00, 0x01]
+        connect += proxy.address
+        connect += [0x00]
+        for value: UInt16 in [0x0018, 0x0028, 0, 0x0100, 0, 0] { connect += le16(value) }
+        try await android.command(HCIOpcode.leCreateConnection, connect)
         var handle: UInt16?
         while handle == nil, let packet = await events.next() {
             if case .event(0x3E, let p) = packet, p.first == 0x01, p[1] == 0 { handle = UInt16(p[2]) | UInt16(p[3]) << 8 }

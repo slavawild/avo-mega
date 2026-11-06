@@ -168,6 +168,10 @@ import IOSurface
     /// Shakes the phone for a second: Android's accelerometer swings as a
     /// hand shaking it would (the engine's `shake`).
     func shakeDevice(reply: @escaping @Sendable (NSError?) -> Void)
+    /// Where a camera's movie is (an encoded CameraVideoSeek in, an encoded
+    /// CameraVideoPlayback out, nil when the camera shows no movie), moving
+    /// it to the second, and pausing or playing it, as the request says first.
+    func cameraVideoPlayback(_ request: Data, reply: @escaping @Sendable (Data?, NSError?) -> Void)
     /// Android's media volume (AndroidVolume), every app's.
     func androidVolume(reply: @escaping @Sendable (Data?, NSError?) -> Void)
     /// Sets it, within its steps; replies with the volume Android has now.

@@ -50,7 +50,12 @@ import Testing
     /// The host agent's watches wait out a pause instead of waking every
     /// few seconds to find Android still paused.
     @Test func theHostAgentsWatchesWaitOutAPause() async throws {
-        let commands = Mutex<[(String, ContinuousClock.Instant)]>([])
+        // In a class: a Mutex on its own, a local, cannot be captured by
+        // the fake adbd's task (Swift 6.3: SendingClosureRisksDataRace).
+        final class Commands: Sendable {
+            let list = Mutex<[(String, ContinuousClock.Instant)]>([])
+        }
+        let commands = Commands()
         let key = try ADBKey.generate()
         let agent = HostAgent(engine: EngineControl(socketPath: "/nonexistent/avo-control.sock"), frames: FrameBridge { _ in },
                               adbKey: key) { _ in
@@ -58,7 +63,7 @@ import Testing
             let adbd = FakeADBD(fileDescriptor: guest, publicKey: key.publicKey!, maxPayload: 256 * 1024)
             Task {
                 await adbd.setShellHandler { command in
-                    commands.withLock { $0.append((command, .now)) }
+                    commands.list.withLock { $0.append((command, .now)) }
                     if command.hasPrefix("getprop sys.boot_completed") { return ("1\n", "", 0) }
                     // On Wi-Fi already: the start's own steps are over at once.
                     if command.hasPrefix("cmd wifi status") { return ("Wifi is connected to \"VirtWifi\"\n", "", 0) }
@@ -70,7 +75,7 @@ import Testing
         }
         try await agent.prepare(deadline: .now + .seconds(30))
         func asked(since start: ContinuousClock.Instant) -> [String] {
-            commands.withLock { $0.filter { $0.1 >= start }.map(\.0) }
+            commands.list.withLock { $0.filter { $0.1 >= start }.map(\.0) }
         }
         // Running: the look every 2 s, the package poll every 3 s.
         let running = ContinuousClock.now

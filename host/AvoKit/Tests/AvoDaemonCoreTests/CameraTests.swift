@@ -1,3 +1,4 @@
+@preconcurrency import AVFoundation
 import AvoIO
 import AvoKit
 import CoreImage
@@ -5,15 +6,78 @@ import CryptoKit
 import Foundation
 import ImageIO
 import Testing
+import UniformTypeIdentifiers
 @testable import AvoDaemonCore
 
 @Suite struct CameraSettingsTests {
+    /// Each video's framing is kept by its path, applies at once, and a
+    /// framing this Avo does not know leaves videos filling, centered.
+    @Test func videoFramingIsKeptPerVideo() throws {
+        var config = VMConfig()
+        let old = config
+        config.cameraVideoFraming["/Videos/1/clip.mov"] = VideoFraming(mode: .fit)
+        config.cameraVideoFraming["/Videos/2/wide.mp4"] = VideoFraming(mode: .fill, position: -0.5)
+        #expect(config.effect(of: old) == .immediate)
+        let decoded = try JSONDecoder().decode(VMConfig.self, from: JSONEncoder().encode(config))
+        #expect(decoded.cameraVideoFraming == config.cameraVideoFraming)
+        // Framing from before rotation and zoom: unturned, unzoomed.
+        let older = Data(#"{"cameraVideoFraming": {"/a.mov": {"mode": "fit", "position": 0.5}}}"#.utf8)
+        #expect(try JSONDecoder().decode(VMConfig.self, from: older).cameraVideoFraming["/a.mov"] == VideoFraming(mode: .fit, position: 0.5))
+        let unknown = Data(#"{"cameraVideoFraming": {"/a.mov": {"mode": "zoom", "position": 0}}}"#.utf8)
+        #expect(try JSONDecoder().decode(VMConfig.self, from: unknown).cameraVideoFraming == [:])
+        #expect(VideoFraming(position: 7).clampedPosition == 1 && VideoFraming(position: -.infinity).clampedPosition == 0)
+        #expect(VideoFraming(zoom: 10).clampedZoom == 3 && VideoFraming(zoom: 0.1).clampedZoom == 0.5 && VideoFraming(zoom: .nan).clampedZoom == 1)
+        // A part to choose only where some of the video is cropped.
+        #expect(VideoFraming(mode: .fill).crops && !VideoFraming(mode: .fit).crops && !VideoFraming(mode: .stretch).crops)
+        #expect(VideoFraming(mode: .stretch, zoom: 1.5).crops)
+    }
+
+    /// Whose sound Android's microphone hears: the front camera's video,
+    /// else the back one's, only with the microphone on and set to it.
+    @Test func theMicrophoneHearsTheFrontVideoFirst() {
+        let front = "/Videos/1/Front clip.mov", back = "/Videos/2/back.mp4"
+        var config = VMConfig(backCamera: .video(back), frontCamera: .video(front), microphoneVideoAudio: true)
+        #expect(config.soundtrackCamera == 1)
+        #expect(config.videoMicrophonePCMPath == "/Videos/1/Front clip.pcm")
+        #expect(VMMEngine.videoMicrophoneCommand(config) == "microphone file /Videos/1/Front clip.pcm")
+        config.frontCamera = .emulated
+        #expect(config.soundtrackCamera == 0)
+        #expect(config.videoMicrophonePCMPath == "/Videos/2/back.pcm")
+        // The Mac's microphone: set to it, with no video, with cameras off,
+        // and (as silence follows anyway) with the microphone off.
+        let changes: [(inout VMConfig) -> Void] = [{ $0.microphoneVideoAudio = false }, { $0.backCamera = .mac("0x1") },
+                                                   { $0.camerasEnabled = false }, { $0.microphoneEnabled = false }]
+        for change in changes {
+            var other = config
+            change(&other)
+            #expect(other.soundtrackCamera == nil)
+            #expect(other.videoMicrophonePCMPath == nil)
+            #expect(VMMEngine.videoMicrophoneCommand(other) == "microphone mac")
+        }
+    }
+
+    /// Pictures are told from movies by their kind; a picture has no sound
+    /// for the microphone, so the other camera's movie is heard.
+    @Test func picturesAreToldFromMovies() {
+        #expect(CameraSource.isPicture("/V/1/photo.JPG") && CameraSource.isPicture("/V/2/shot.heic") && CameraSource.isPicture("/V/3/a b.png"))
+        #expect(!CameraSource.isPicture("/V/4/clip.mov") && !CameraSource.isPicture("/V/5/clip.mp4"))
+        #expect(CameraSource.video("/V/1/photo.jpg").movieFilePath == nil)
+        #expect(CameraSource.video("/V/5/clip.mp4").movieFilePath == "/V/5/clip.mp4")
+        let config = VMConfig(backCamera: .video("/V/5/clip.mp4"), frontCamera: .video("/V/1/photo.jpg"), microphoneVideoAudio: true)
+        #expect(config.soundtrackCamera == 0)
+        #expect(config.videoMicrophonePCMPath == "/V/5/clip.pcm")
+        #expect(VMMEngine.soundtrackSyncCommand(12.5) == "microphone sync 12.500")
+        #expect(VMMEngine.soundtrackSyncCommand(-3) == "microphone sync 0.000")
+    }
+
     @Test func sourcesAreSavedAsWords() throws {
-        for source in [CameraSource.emulated, .none, .mac("0x1424000005ac8600")] {
+        for source in [CameraSource.emulated, .none, .mac("0x1424000005ac8600"), .video("/tmp/test-camera.mp4")] {
             #expect(CameraSource(rawValue: source.rawValue) == source)
             #expect(try JSONDecoder().decode(CameraSource.self, from: JSONEncoder().encode(source)) == source)
         }
         #expect(CameraSource(rawValue: "mac:") == nil && CameraSource(rawValue: "webcam") == nil)
+        #expect(CameraSource(rawValue: "video:") == nil)
+        #expect(CameraSource.video("/tmp/test-camera.mp4").videoFilePath == "/tmp/test-camera.mp4")
         // A file from before cameras, or with a source this Avo does not know: emulated.
         let old = try JSONDecoder().decode(VMConfig.self, from: Data(#"{"memoryMiB": 4096, "frontCamera": "hologram"}"#.utf8))
         #expect(old.backCamera == .emulated && old.frontCamera == .emulated)
@@ -208,6 +272,315 @@ import Testing
             #expect(filled.extent == CGRect(x: 0, y: 0, width: width, height: height))
             #expect(size(try #require(JPEGEncoder().jpeg(filled)))! == (width, height))
         }
+    }
+
+    /// As a phone's sensor: an upright picture comes a quarter turned
+    /// counterclockwise (its top on the left), at the size Android asked
+    /// for, and the HAL says the sensor is turned that way.
+    @Test func framesComeTurnedAsAPhonesSensor() throws {
+        #expect(CameraFeed.sensorOrientation == 90)
+        #expect(GuestCamera.config.contains("<Orientation degree=\"\(CameraFeed.sensorOrientation)\"/>"))
+        // A portrait picture, red above and blue below.
+        let red = CIImage(color: .red).cropped(to: CGRect(x: 0, y: 360, width: 360, height: 360))
+        let blue = CIImage(color: .blue).cropped(to: CGRect(x: 0, y: 0, width: 360, height: 360))
+        let frame = JPEGEncoder.sensorFrame(red.composited(over: blue), width: 640, height: 480)
+        #expect(frame.extent == CGRect(x: 0, y: 0, width: 640, height: 480))
+        let jpeg = try #require(JPEGEncoder().jpeg(frame))
+        let left = try #require(color(jpeg, x: 0.15, y: 0.5)), right = try #require(color(jpeg, x: 0.85, y: 0.5))
+        #expect(left.red > 150 && left.blue < 100, "the picture's top is on the left: \(left)")
+        #expect(right.blue > 150 && right.red < 100, "its bottom on the right: \(right)")
+        // The drawn scene and notices turn the same way, at the same size.
+        let turned = try #require(DrawnCamera.draw(.notice(.missing), width: 640, height: 480, time: 0, turned: true))
+        #expect((turned.width, turned.height) == (640, 480))
+    }
+
+    /// A wide picture, red on the left and blue on the right, in a square:
+    /// filling shows the part its position says, whole it sits on black.
+    @Test func videosFillOrFitAsTheirFramingSays() throws {
+        let red = CIImage(color: .red).cropped(to: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let blue = CIImage(color: .blue).cropped(to: CGRect(x: 100, y: 0, width: 100, height: 100))
+        let wide = red.composited(over: blue)
+        func colors(_ framing: VideoFraming) throws -> [(red: Int, green: Int, blue: Int)] {
+            let placed = JPEGEncoder.placing(wide, width: 100, height: 100, framing: framing)
+            #expect(placed.extent == CGRect(x: 0, y: 0, width: 100, height: 100))
+            let jpeg = try #require(JPEGEncoder().jpeg(placed))
+            return try [(0.1, 0.5), (0.9, 0.5), (0.5, 0.05)].map { try #require(color(jpeg, x: $0.0, y: $0.1)) }
+        }
+        let isRed = { (c: (red: Int, green: Int, blue: Int)) in c.red > 150 && c.blue < 100 }
+        let isBlue = { (c: (red: Int, green: Int, blue: Int)) in c.blue > 150 && c.red < 100 }
+        let isBlack = { (c: (red: Int, green: Int, blue: Int)) in c.red < 40 && c.green < 40 && c.blue < 40 }
+        let left = try colors(VideoFraming(mode: .fill, position: -1))
+        #expect(isRed(left[0]) && isRed(left[1]), "its left edge: \(left)")
+        let right = try colors(VideoFraming(mode: .fill, position: 1))
+        #expect(isBlue(right[0]) && isBlue(right[1]), "its right edge: \(right)")
+        let middle = try colors(VideoFraming())
+        #expect(isRed(middle[0]) && isBlue(middle[1]), "its middle: \(middle)")
+        let whole = try colors(VideoFraming(mode: .fit))
+        #expect(isRed(whole[0]) && isBlue(whole[1]) && isBlack(whole[2]), "all of it, black above: \(whole)")
+        // Stretched: all of it, top to bottom, no black.
+        let stretched = try colors(VideoFraming(mode: .stretch))
+        #expect(isRed(stretched[0]) && isBlue(stretched[1]) && !isBlack(stretched[2]), "stretched: \(stretched)")
+        // Zoomed in twice, the position picks within the left or right half.
+        let closeLeft = try colors(VideoFraming(mode: .fill, position: -1, zoom: 2))
+        #expect(isRed(closeLeft[0]) && isRed(closeLeft[1]), "zoomed on its left: \(closeLeft)")
+        let closeRight = try colors(VideoFraming(mode: .fill, position: 1, zoom: 2))
+        #expect(isBlue(closeRight[0]) && isBlue(closeRight[1]), "zoomed on its right: \(closeRight)")
+        // Zoomed out, black around it, the video in the middle.
+        let away = try colors(VideoFraming(mode: .stretch, zoom: 0.5))
+        #expect(isBlack(away[0]) && isBlack(away[1]) && isBlack(away[2]), "black around it: \(away)")
+        let awayJPEG = try #require(JPEGEncoder().jpeg(JPEGEncoder.placing(wide, width: 100, height: 100, framing: VideoFraming(mode: .stretch, zoom: 0.5))))
+        let inside = try #require(color(awayJPEG, x: 0.4, y: 0.5))
+        #expect(inside.red > 150, "the video in the middle: \(inside)")
+    }
+
+    /// A movie is decoded no bigger than the turned portrait the camera
+    /// needs (Android's frame turned) whichever way its framing turns it,
+    /// in its own orientation, and as it is when it is smaller.
+    @Test func moviesAreDecodedAtTheSizeTheCameraNeeds() {
+        let hd = CameraFeed.Request(width: 1280, height: 720, fps: 30)
+        // 4K landscape: covering a 720×1280 portrait takes 1280 rows.
+        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 3840, height: 2160), orientation: .up, request: hd)
+                == CGSize(width: 2276, height: 1280))
+        // A 1920×1080 movie turned either way needs all its 1080 rows for 1280: as it is.
+        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 1920, height: 1080), orientation: .right, request: hd) == nil)
+        // 4K portrait: 3840 rows cover 1280 at a third, but turned its 2160 need 0.59.
+        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 2160, height: 3840), orientation: .up, request: hd)
+                == CGSize(width: 1280, height: 2276))
+        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 640, height: 360), orientation: .up, request: hd) == nil)
+        // Zoomed in one and a half times, 4K decodes that much bigger; twice, as it is.
+        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 3840, height: 2160), orientation: .up, request: hd, zoom: 1.5)
+                == CGSize(width: 3414, height: 1920))
+        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 3840, height: 2160), orientation: .up, request: hd, zoom: 2) == nil)
+        // Zoomed out, no smaller than unzoomed.
+        #expect(FileVideoCamera.decodeSize(natural: CGSize(width: 3840, height: 2160), orientation: .up, request: hd, zoom: 0.5)
+                == CGSize(width: 2276, height: 1280))
+    }
+
+    /// Turned a quarter clockwise, a picture's left edge is on top.
+    @Test func videosTurnAsTheirFramingSays() throws {
+        let red = CIImage(color: .red).cropped(to: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let blue = CIImage(color: .blue).cropped(to: CGRect(x: 100, y: 0, width: 100, height: 100))
+        let turned = JPEGEncoder.turned(red.composited(over: blue), quarterTurns: 1)
+        #expect(turned.extent.size == CGSize(width: 100, height: 200))
+        let placed = JPEGEncoder.placing(turned, width: 100, height: 200, framing: VideoFraming(mode: .fit))
+        let jpeg = try #require(JPEGEncoder().jpeg(placed))
+        let top = try #require(color(jpeg, x: 0.5, y: 0.1)), bottom = try #require(color(jpeg, x: 0.5, y: 0.9))
+        #expect(top.red > 150 && top.blue < 100, "the left edge on top: \(top)")
+        #expect(bottom.blue > 150 && bottom.red < 100, "the right edge below: \(bottom)")
+        #expect(JPEGEncoder.turned(turned, quarterTurns: 3).extent.size == CGSize(width: 200, height: 100))
+        #expect(VideoFraming(rotation: 5).quarterTurns == 1 && VideoFraming(rotation: -1).quarterTurns == 3)
+    }
+
+    /// Phones record portrait movies sideways and say how to turn them.
+    @Test func phoneMoviesAreTurnedUpright() {
+        #expect(FileVideoCamera.orientation(.identity) == .up)
+        #expect(FileVideoCamera.orientation(CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 1080, ty: 0)) == .right)
+        #expect(FileVideoCamera.orientation(CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: 1920)) == .left)
+        #expect(FileVideoCamera.orientation(CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: 1920, ty: 1080)) == .down)
+    }
+
+    /// A movie half red, half blue plays at the size Android asks for, and
+    /// starts over at its end. One pass shows at most red then blue; a
+    /// third run of one color means it started over, wherever the first
+    /// frame fell (a busy CI machine encodes its first frame late).
+    @Test func aVideoCameraPlaysItsMovieOverAndOver() async throws {
+        let url = FileManager.default.temporaryDirectory.appending(path: "avo-cam-\(UUID().uuidString.prefix(8)).mov")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try await Self.writeMovie(url, colors: Array(repeating: (255, 0, 0), count: 5) + Array(repeating: (0, 0, 255), count: 5), fps: 10)
+        final class Frames: @unchecked Sendable {
+            let lock = NSLock()
+            var all: [Data] = []
+        }
+        let frames = Frames()
+        let camera = FileVideoCamera(path: url.path, request: .init(width: 32, height: 24, fps: 20)) { jpeg in
+            frames.lock.withLock { frames.all.append(jpeg) }
+        }
+        camera.start()
+        try await Task.sleep(for: .milliseconds(3500))
+        camera.stop()
+        let jpegs = frames.lock.withLock { frames.all }
+        #expect(jpegs.count >= 10, "frames keep coming: \(jpegs.count)")
+        #expect(jpegs.allSatisfy { size($0).map { $0 == (32, 24) } ?? false })
+        // Runs of one color: red, blue, red… or blue, red, blue….
+        var runs: [String] = []
+        for jpeg in jpegs {
+            guard let rgb = centerColor(jpeg) else { continue }
+            let color = rgb.red > 150 && rgb.blue < 100 ? "red" : rgb.blue > 150 && rgb.red < 100 ? "blue" : "other"
+            if color != "other", runs.last != color { runs.append(color) }
+        }
+        #expect(runs.count >= 3, "the movie started over: \(runs)")
+    }
+
+    /// A video camera starts where it is told, and moves when asked: the
+    /// movie is red for its first half second, blue for the second half.
+    @Test func aVideoCameraStartsAndMovesWhereAsked() async throws {
+        let url = FileManager.default.temporaryDirectory.appending(path: "avo-cam-\(UUID().uuidString.prefix(8)).mov")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try await Self.writeMovie(url, colors: Array(repeating: (255, 0, 0), count: 5) + Array(repeating: (0, 0, 255), count: 5), fps: 10)
+        final class Frames: @unchecked Sendable {
+            let lock = NSLock()
+            var all: [Data] = []
+        }
+        let frames = Frames()
+        let camera = FileVideoCamera(path: url.path, request: .init(width: 32, height: 24, fps: 20), deliver: { jpeg in
+            frames.lock.withLock { frames.all.append(jpeg) }
+        }, startAt: 0.7)
+        #expect(camera.playback().position == 0.7, "where it will start, before it loads")
+        camera.start()
+        func colors() -> [String] {
+            frames.lock.withLock { frames.all }.compactMap { jpeg in
+                centerColor(jpeg).map { $0.red > 150 && $0.blue < 100 ? "red" : $0.blue > 150 && $0.red < 100 ? "blue" : "other" }
+            }
+        }
+        for _ in 0..<100 where colors().isEmpty { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(colors().first == "blue", "it starts in the movie's second half: \(colors())")
+        let moved = camera.seek(to: 0.1)
+        #expect(moved.position == 0.1 && moved.playing)
+        #expect(abs((moved.duration ?? 0) - 1) < 0.01, "\(String(describing: moved.duration))")
+        frames.lock.withLock { frames.all = [] }
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(colors().contains("red"), "moved into the first half: \(colors())")
+        #expect(camera.seek(to: 50).position < 1, "no further than its end")
+        // Paused, it stays where it is, its frame sent again and again.
+        _ = camera.seek(to: 0.1)
+        try await Task.sleep(for: .milliseconds(100))
+        camera.setPaused(true)
+        let held = camera.playback()
+        #expect(held.paused)
+        frames.lock.withLock { frames.all = [] }
+        try await Task.sleep(for: .milliseconds(700))
+        #expect(camera.playback().position == held.position, "a paused movie does not move")
+        #expect(!colors().isEmpty && !colors().contains("blue"), "still in its red half: \(colors())")
+        // Moved while paused, it stays paused there; played, it goes on.
+        #expect(camera.seek(to: 0.7).paused)
+        camera.setPaused(false)
+        #expect(!camera.playback().paused)
+        camera.stop()
+    }
+
+    /// A picture camera sends its picture at Android's size, framed, and
+    /// the same JPEG every frame until the framing changes.
+    @Test func aPictureCameraShowsItsPictureStill() async throws {
+        let url = FileManager.default.temporaryDirectory.appending(path: "avo-pic-\(UUID().uuidString.prefix(8)).png")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let context = try #require(CGContext(data: nil, width: 200, height: 100, bitsPerComponent: 8, bytesPerRow: 0,
+                                             space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: 200, height: 100))
+        let destination = try #require(CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, try #require(context.makeImage()), nil)
+        #expect(CGImageDestinationFinalize(destination))
+        final class Frames: @unchecked Sendable {
+            let lock = NSLock()
+            var all: [Data] = []
+            var framing = VideoFraming()
+        }
+        let frames = Frames()
+        let camera = PictureCamera(path: url.path, request: .init(width: 32, height: 24, fps: 20), deliver: { jpeg in
+            frames.lock.withLock { frames.all.append(jpeg) }
+        }, framing: { frames.lock.withLock { frames.framing } })
+        camera.start()
+        // Reading the picture can take a while on a busy machine: wait for its frames.
+        for _ in 0..<150 where frames.lock.withLock({ frames.all.count }) < 4 { try await Task.sleep(for: .milliseconds(20)) }
+        let still = frames.lock.withLock { frames.all }
+        #expect(still.count >= 4, "frames keep coming: \(still.count)")
+        #expect(Set(still).count == 1, "the same JPEG every frame")
+        #expect(still.first.flatMap(size).map { $0 == (32, 24) } ?? false)
+        #expect(still.first.flatMap(centerColor).map { $0.red > 150 && $0.blue < 100 } ?? false)
+        // Zoomed out on black: a new JPEG.
+        frames.lock.withLock { frames.framing = VideoFraming(mode: .fit, zoom: 0.5) }
+        for _ in 0..<150 where Set(frames.lock.withLock { frames.all }).count < 2 { try await Task.sleep(for: .milliseconds(20)) }
+        camera.stop()
+        #expect(Set(frames.lock.withLock { frames.all }).count == 2)
+    }
+
+    /// One frame of each color, at `fps`, as Motion JPEG (no hardware encoder needed).
+    private static func writeMovie(_ url: URL, colors: [(UInt8, UInt8, UInt8)], fps: Int32, width: Int = 64, height: Int = 48) async throws {
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.jpeg, AVVideoWidthKey: width, AVVideoHeightKey: height,
+        ])
+        input.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height,
+        ])
+        writer.add(input)
+        #expect(writer.startWriting())
+        writer.startSession(atSourceTime: .zero)
+        for (index, color) in colors.enumerated() {
+            while !input.isReadyForMoreMediaData { try await Task.sleep(for: .milliseconds(5)) }
+            var created: CVPixelBuffer?
+            CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, nil, &created)
+            let pixels = try #require(created)
+            CVPixelBufferLockBaseAddress(pixels, [])
+            let base = try #require(CVPixelBufferGetBaseAddress(pixels)).assumingMemoryBound(to: UInt8.self)
+            let row = CVPixelBufferGetBytesPerRow(pixels)
+            for y in 0..<height {
+                for x in 0..<width {
+                    let pixel = base + y * row + x * 4
+                    pixel[0] = color.2
+                    pixel[1] = color.1
+                    pixel[2] = color.0
+                    pixel[3] = 255
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(pixels, [])
+            #expect(adaptor.append(pixels, withPresentationTime: CMTime(value: CMTimeValue(index), timescale: fps)))
+        }
+        input.markAsFinished()
+        writer.endSession(atSourceTime: CMTime(value: CMTimeValue(colors.count), timescale: fps))
+        await writer.finishWriting()
+        #expect(writer.status == .completed, "\(String(describing: writer.error))")
+    }
+
+    /// The color at a picture's middle.
+    private func centerColor(_ jpeg: Data) -> (red: Int, green: Int, blue: Int)? {
+        color(jpeg, x: 0.5, y: 0.5)
+    }
+
+    /// The color at (`x`, `y`) of a picture, as fractions from its top left.
+    private func color(_ jpeg: Data, x: Double, y: Double) -> (red: Int, green: Int, blue: Int)? {
+        guard let source = CGImageSourceCreateWithData(jpeg as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        var pixel = [UInt8](repeating: 0, count: 4)
+        let drawn = pixel.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(data: bytes.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                          space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { return false }
+            // That pixel alone, not the whole picture squeezed into one
+            // (the context's y grows upward, the picture's rows downward).
+            let (w, h) = (CGFloat(image.width), CGFloat(image.height))
+            context.draw(image, in: CGRect(x: -(w * x).rounded(.down), y: -(h * (1 - y)).rounded(.down), width: w, height: h))
+            return true
+        }
+        return drawn ? (Int(pixel[0]), Int(pixel[1]), Int(pixel[2])) : nil
+    }
+
+    /// A video camera says when its movie starts over (its soundtrack then
+    /// starts over too), and only then: the same request again leaves the
+    /// movie playing where it is.
+    @Test func aVideoCameraSaysWhenItsMovieStartsOver() {
+        final class Starts: @unchecked Sendable {
+            let lock = NSLock()
+            var cameras: [Int] = []
+        }
+        let starts = Starts()
+        let path = FileManager.default.temporaryDirectory.appending(path: "avo-cam-\(UUID().uuidString.prefix(8)).sock").path
+        let feed = CameraFeed(socketPath: path, sources: [.none, .video("/nonexistent/a.mp4")]) { camera, _, _ in
+            starts.lock.withLock { starts.cameras.append(camera) }
+        }
+        feed.handle("camera 1 on 320 240 15")
+        feed.handle("camera 1 on 320 240 15")
+        feed.handle("camera 1 on 640 480 30")
+        feed.handle("camera 0 on 320 240 15")
+        feed.use([.none, .video("/nonexistent/b.mp4")])
+        feed.use([.none, .video("/nonexistent/b.mp4")])
+        feed.handle("camera 1 off")
+        // Runs after everything above on the feed's queue.
+        feed.stop()
+        #expect(starts.lock.withLock { starts.cameras } == [1, 1, 1])
     }
 
     /// An emulated camera reaches a fake avo-vmm: the feed's handshake, then

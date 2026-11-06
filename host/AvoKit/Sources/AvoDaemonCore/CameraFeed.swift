@@ -14,7 +14,8 @@ import UniformTypeIdentifiers
 /// event stream and the source chosen for it starts: one of this Mac's
 /// cameras (its light is on only while Android uses it), or a scene drawn
 /// here for an emulated one. Its frames go to avo-vmm as JPEG pictures of
-/// exactly that size (the camera's picture cropped to fill it), on a control
+/// exactly that size (the camera's picture cropped to fill it, turned as a
+/// phone's sensor is: `sensorOrientation`), on a control
 /// connection of their own (`camera feed`). `camera <index> off` stops it,
 /// and a source chosen while a camera streams takes over at once.
 ///
@@ -22,6 +23,17 @@ import UniformTypeIdentifiers
 /// one of the Mac's cameras. Until it is allowed (or while the camera chosen
 /// is gone and the Mac has none), Android sees a picture that says why.
 public final class CameraFeed: @unchecked Sendable {
+    /// How far both sensors are turned, as on a phone (GuestCamera's
+    /// `<Orientation>`): Android asks for landscape frames and apps turn them
+    /// a quarter clockwise to show them on the upright phone, and photos
+    /// say so. Every source therefore sends its upright picture turned a
+    /// quarter counterclockwise (`JPEGEncoder.sensorFrame`), so a portrait
+    /// app sees a portrait camera: a phone video fills it, photos come out
+    /// portrait. Avo's window shapes are not a turned phone to Android
+    /// (its displays keep rotation 0), so a landscape window shows the same
+    /// upright picture, cropped to its shape.
+    public static let sensorOrientation = 90
+
     /// What Android asked a camera for.
     struct Request: Equatable, Sendable {
         let width: Int
@@ -73,14 +85,49 @@ public final class CameraFeed: @unchecked Sendable {
     /// Frames waiting for `output`: past a few, new ones are dropped.
     private let lock = NSLock()
     private var backlog = 0
+    /// A video source's movie started on this camera (Android began
+    /// streaming it, asked for a new size, or chose the video while it
+    /// streams: from its beginning, or where `videoPlayback` put it), was
+    /// moved to another second, paused or played on: its soundtrack does
+    /// the same.
+    private let videoStarted: (@Sendable (_ camera: Int, _ seconds: Double, _ paused: Bool) -> Void)?
+    /// Where a camera's movie starts the next time it plays, when it was
+    /// moved while no app used the camera. On `state`.
+    private var startAt: [Int: Double] = [:]
+    /// Cameras whose movie is paused (Settings' pause button): it stays so
+    /// when the camera starts again, until the movie is played or another
+    /// source chosen. On `state`.
+    private var paused: Set<Int> = []
+    /// How each video fills the picture (VMConfig.cameraVideoFraming): read
+    /// by a playing video at every frame, so a change shows at once.
+    private let framingLock = NSLock()
+    private var framing: [String: VideoFraming]
 
-    public init(socketPath: String, sources: [CameraSource]) {
+    public init(socketPath: String, sources: [CameraSource], framing: [String: VideoFraming] = [:],
+                videoStarted: (@Sendable (_ camera: Int, _ seconds: Double, _ paused: Bool) -> Void)? = nil) {
         self.socketPath = socketPath
         self.sources = sources
+        self.framing = framing
+        self.videoStarted = videoStarted
     }
 
-    /// A line of avo-vmm's event stream (others are ignored).
+    /// How each video fills the picture now; a playing one follows at its next frame.
+    public func useFraming(_ framing: [String: VideoFraming]) {
+        framingLock.withLock { self.framing = framing }
+    }
+
+    func framing(of path: String) -> VideoFraming {
+        framingLock.withLock { framing[path] } ?? VideoFraming()
+    }
+
+    /// A line of avo-vmm's event stream (others are ignored). How a stream
+    /// went inside Android (`camerastats`, avo-vmm's virtio/media.rs) goes
+    /// to the log, at debug level, beside what the Mac sent.
     public func handle(_ line: String) {
+        if line.hasPrefix("camerastats ") {
+            logger.debug("\(line, privacy: .public)")
+            return
+        }
         guard let event = Self.parse(line) else { return }
         state.async { [self] in
             switch event {
@@ -103,6 +150,8 @@ public final class CameraFeed: @unchecked Sendable {
             let old = self.sources
             self.sources = sources
             for camera in sources.indices where camera >= old.count || old[camera] != sources[camera] {
+                startAt[camera] = nil
+                paused.remove(camera)
                 restart(camera)
             }
         }
@@ -135,10 +184,43 @@ public final class CameraFeed: @unchecked Sendable {
             producer = DrawnCamera(.scene(camera: camera), request: request, deliver: deliver)
         case .mac(let id):
             producer = macCamera(id, camera: camera, request: request, deliver: deliver)
+        case .video(let path) where CameraSource.isPicture(path):
+            producer = PictureCamera(path: path, request: request, deliver: deliver) { [weak self] in
+                self?.framing(of: path) ?? VideoFraming()
+            }
+        case .video(let path):
+            producer = FileVideoCamera(path: path, request: request, deliver: deliver, startAt: startAt.removeValue(forKey: camera) ?? 0,
+                                       paused: paused.contains(camera)) { [weak self] in
+                self?.framing(of: path) ?? VideoFraming()
+            }
         }
         logger.notice("camera \(camera, privacy: .public): \(request.width)×\(request.height) at \(request.fps) fps from \(self.sources[camera].rawValue, privacy: .public)")
         producers[camera] = producer
         producer?.start()
+        if let video = producer as? FileVideoCamera { videoStarted?(camera, video.startAt, paused.contains(camera)) }
+    }
+
+    /// Where camera `camera`'s movie is, after moving it to `seconds` into
+    /// it and pausing or playing it, when given (Settings › Devices ›
+    /// Cameras); nil when the camera shows no movie. While no app uses the
+    /// camera, the movie starts there (and so) the next time it plays.
+    public func videoPlayback(camera: Int, seekTo seconds: Double?, paused pause: Bool? = nil) -> CameraVideoPlayback? {
+        let (playback, changed) = state.sync { () -> (CameraVideoPlayback?, Bool) in
+            guard camera >= 0, camera < sources.count, sources[camera].movieFilePath != nil else { return (nil, false) }
+            if let pause {
+                if pause { paused.insert(camera) } else { paused.remove(camera) }
+            }
+            let changed = seconds != nil || pause != nil
+            if let video = producers[camera] as? FileVideoCamera {
+                if let pause { video.setPaused(pause) }
+                if let seconds { return (video.seek(to: seconds), true) }
+                return (video.playback(), changed)
+            }
+            if let seconds, seconds.isFinite { startAt[camera] = max(0, seconds) }
+            return (CameraVideoPlayback(playing: false, position: startAt[camera] ?? 0, duration: nil, paused: paused.contains(camera)), false)
+        }
+        if changed, let playback { videoStarted?(camera, playback.position, playback.paused) }
+        return playback
     }
 
     /// On `state`: the Mac's camera `id` (or its default one when that is
@@ -250,6 +332,55 @@ final class JPEGEncoder: @unchecked Sendable {
         context.jpegRepresentation(of: image, colorSpace: colorSpace, options: [quality: 0.8])
     }
 
+    /// An upright picture as the turned sensor gives it (CameraFeed.sensorOrientation):
+    /// filled into the portrait `height`×`width` the phone shows, then
+    /// turned a quarter counterclockwise into the `width`×`height` frame
+    /// Android asked for. Turned back a quarter clockwise, as apps do, it is
+    /// upright again.
+    static func sensorFrame(_ upright: CIImage, width: Int, height: Int, framing: VideoFraming = VideoFraming()) -> CIImage {
+        placing(upright, width: height, height: width, framing: framing)
+            .transformed(by: CGAffineTransform(translationX: CGFloat(width), y: 0).rotated(by: .pi / 2))
+            .cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
+    }
+
+    /// `image` in `width`×`height` as `framing` says: covering it, whole on
+    /// black, or stretched to it; times its zoom. Where it overflows, its
+    /// position picks the part along the side that overflows most (the
+    /// other is centered); where it falls short, it is centered on black.
+    static func placing(_ image: CIImage, width: Int, height: Int, framing: VideoFraming) -> CIImage {
+        let extent = image.extent
+        let frame = CGRect(x: 0, y: 0, width: width, height: height)
+        let (wide, high) = (CGFloat(width) / extent.width, CGFloat(height) / extent.height)
+        let zoom = CGFloat(framing.clampedZoom)
+        let (sx, sy): (CGFloat, CGFloat)
+        switch framing.mode {
+        case .fill: (sx, sy) = (max(wide, high) * zoom, max(wide, high) * zoom)
+        case .fit: (sx, sy) = (min(wide, high) * zoom, min(wide, high) * zoom)
+        case .stretch: (sx, sy) = (wide * zoom, high * zoom)
+        }
+        let overX = extent.width * sx - CGFloat(width), overY = extent.height * sy - CGFloat(height)
+        // -1 keeps the left (top) edge, 1 the right (bottom) one.
+        let along = CGFloat(framing.clampedPosition)
+        let alongX = overX >= overY
+        let x = overX > 0 ? overX * (alongX ? (1 + along) / 2 : 0.5) : overX / 2
+        let y = overY > 0 ? overY * (alongX ? 0.5 : (1 - along) / 2) : overY / 2
+        return image
+            .transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY)
+                .concatenating(CGAffineTransform(scaleX: sx, y: sy))
+                .concatenating(CGAffineTransform(translationX: -x, y: -y)))
+            .composited(over: CIImage(color: .black).cropped(to: frame))
+            .cropped(to: frame)
+    }
+
+    /// `image` turned `quarterTurns` quarters clockwise (its extent moves;
+    /// `placing` puts it back at the origin).
+    static func turned(_ image: CIImage, quarterTurns: Int) -> CIImage {
+        let turns = ((quarterTurns % 4) + 4) % 4
+        guard turns != 0 else { return image }
+        // y grows upward here: clockwise is a negative angle.
+        return image.transformed(by: CGAffineTransform(rotationAngle: -CGFloat(turns) * .pi / 2))
+    }
+
     /// `image` scaled to cover `width`×`height` and cropped to it, centered.
     static func filling(_ image: CIImage, width: Int, height: Int) -> CIImage {
         let extent = image.extent
@@ -280,9 +411,11 @@ final class MacCamera: NSObject, CameraProducer, AVCaptureVideoDataOutputSampleB
         super.init()
         session.beginConfiguration()
         defer { session.commitConfiguration() }
-        // The smallest common preset that holds Android's size; the picture is cropped to it.
+        // The smallest common preset that holds the portrait the phone shows
+        // (Android's size turned, JPEGEncoder.sensorFrame); the picture is
+        // cropped to it. Taller than any of them: the camera's best.
         let presets: [(AVCaptureSession.Preset, Int, Int)] = [(.vga640x480, 640, 480), (.hd1280x720, 1280, 720), (.hd1920x1080, 1920, 1080)]
-        let preset = presets.first { $0.1 >= request.width && $0.2 >= request.height && session.canSetSessionPreset($0.0) }?.0 ?? .high
+        let preset = presets.first { $0.1 >= request.height && $0.2 >= request.width && session.canSetSessionPreset($0.0) }?.0 ?? .high
         if session.canSetSessionPreset(preset) { session.sessionPreset = preset }
         let input = try AVCaptureDeviceInput(device: device)
         guard session.canAddInput(input) else { throw AvoError.internalError("\(device.localizedName) is in use") }
@@ -310,8 +443,472 @@ final class MacCamera: NSObject, CameraProducer, AVCaptureVideoDataOutputSampleB
         let interval = CMTime(value: 1, timescale: CMTimeScale(request.fps))
         due = time + CMTimeMultiplyByFloat64(interval, multiplier: 0.8)
         guard let pixels = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let image = JPEGEncoder.filling(CIImage(cvPixelBuffer: pixels), width: request.width, height: request.height)
+        let image = JPEGEncoder.sensorFrame(CIImage(cvPixelBuffer: pixels), width: request.width, height: request.height)
         if let jpeg = encoder.jpeg(image) { deliver(jpeg) }
+    }
+}
+
+/// Loop a local video into the existing JPEG camera-feed protocol.
+///
+/// The movie is decoded in order by an AVAssetReader, as a player does,
+/// rather than looked up frame by frame: a lookup decodes from the last key
+/// frame every time, too slow for HD at Android's rate. On each tick of the
+/// camera's clock the frame due at that moment of the movie is sent (the
+/// last one again when the movie has no newer frame yet); at the movie's end
+/// (`asset.duration`, where its soundtrack sidecar ends too) the reader
+/// starts over from the beginning. A slow tick decodes the frames it missed
+/// without sending them, so the picture never falls behind real time.
+/// The asset is never played with audio.
+final class FileVideoCamera: CameraProducer, @unchecked Sendable {
+    /// What the reader needs, loaded once with AVFoundation's async API.
+    private struct Movie {
+        let track: AVAssetTrack
+        /// Seconds; the loop's length.
+        let duration: Double
+        let orientation: CGImagePropertyOrientation
+        /// As recorded, before `orientation` turns it upright.
+        let naturalSize: CGSize
+    }
+
+    /// A decoded picture handed to the encoder's queue (read only there).
+    private struct Pixels: @unchecked Sendable {
+        let buffer: CVPixelBuffer
+    }
+
+    private let asset: AVURLAsset
+    private let request: CameraFeed.Request
+    private let deliver: @Sendable (Data) -> Void
+    /// Turning, framing and JPEG encoding run on a queue of their own, so
+    /// the clock and the decoding on `queue` never wait for them: a frame
+    /// whose encoding is not done yet is replaced by the last one sent.
+    private let encoder = JPEGEncoder()
+    private let encodeQueue = DispatchQueue(label: "com.avodroid.cameras.video.encode")
+    private let clock = ContinuousClock()
+    private let logger = Logger(subsystem: AvoIdentifiers.logSubsystem, category: "cameras")
+    /// Everything below changes on `queue` only.
+    private let queue = DispatchQueue(label: "com.avodroid.cameras.video")
+    /// A picture is on `encodeQueue`; a newer one waits for the next tick.
+    private var encoding = false
+    private var newPixels = false
+    /// Decode at the size the camera needs (`decodeSize`); off when this
+    /// movie's decoder refused to scale, so it decodes as recorded.
+    private var scaledDecoding = true
+    /// The zoom the reader decodes enough for; nil when it decodes the movie
+    /// at its own size (any zoom is covered).
+    private var decodedZoom: Double?
+    /// What the log says every five seconds (category "cameras"): frames
+    /// sent and newly encoded, and the time decoding and encoding took.
+    private var stats = (sent: 0, encoded: 0, decode: Duration.zero, encode: Duration.zero)
+    private var statsSince: ContinuousClock.Instant?
+    private var stopped = false
+    private var movie: Movie?
+    private var timer: DispatchSourceTimer?
+    private var reader: AVAssetReader?
+    private var output: AVAssetReaderTrackOutput?
+    /// When the current loop's 0 s was.
+    private var loopStart: ContinuousClock.Instant?
+    /// A decoded frame that is not due yet.
+    private var next: CMSampleBuffer?
+    /// The frame sent last, sent again until a newer one is due.
+    private var last: Data?
+    /// The picture `last` came from, and how it was framed: encoded again
+    /// when the framing changes, even while the movie shows no new frame.
+    private var lastPixels: CVPixelBuffer?
+    private var lastFraming: VideoFraming?
+    /// How the movie fills the picture now (CameraFeed.useFraming).
+    private let framing: @Sendable () -> VideoFraming
+
+    /// Seconds into the movie it starts at (wrapping past its end).
+    let startAt: Double
+    /// Where a move asked for before the movie loaded starts it instead.
+    private var pendingStart: Double?
+    /// Paused: where the movie stays (its frame there sent again and
+    /// again); nil while it plays. On `queue`.
+    private var pausedAt: Double?
+    private var startsPaused: Bool
+
+    init(path: String, request: CameraFeed.Request, deliver: @escaping @Sendable (Data) -> Void, startAt: Double = 0,
+         paused: Bool = false, framing: @escaping @Sendable () -> VideoFraming = { VideoFraming() }) {
+        self.asset = AVURLAsset(url: URL(fileURLWithPath: path))
+        self.request = request
+        self.deliver = deliver
+        self.startAt = startAt.isFinite ? max(0, startAt) : 0
+        self.startsPaused = paused
+        self.framing = framing
+    }
+
+    /// Where the movie is now (not on `queue`).
+    func playback() -> CameraVideoPlayback {
+        queue.sync { currentPlayback() }
+    }
+
+    /// On `queue`: where the movie is now.
+    private func currentPlayback() -> CameraVideoPlayback {
+        let paused = pausedAt != nil || (movie == nil && startsPaused)
+        guard let movie, let loopStart else {
+            return CameraVideoPlayback(playing: true, position: pendingStart ?? startAt, duration: nil, paused: paused)
+        }
+        return CameraVideoPlayback(playing: true, position: pausedAt ?? position(since: loopStart, in: movie),
+                                   duration: movie.duration, paused: paused)
+    }
+
+    /// Pauses the movie where it is (its frame there stays up), or plays it
+    /// on from there (not on `queue`).
+    func setPaused(_ pause: Bool) {
+        queue.sync {
+            guard let movie, let loopStart else {
+                startsPaused = pause
+                return
+            }
+            if pause, pausedAt == nil {
+                pausedAt = position(since: loopStart, in: movie)
+            } else if !pause, let at = pausedAt {
+                self.loopStart = clock.now.advanced(by: .seconds(-at))
+                pausedAt = nil
+            }
+        }
+    }
+
+    /// Moves the movie to `seconds` into it (within it), and says where it
+    /// is now (not on `queue`). Its next frame is from there.
+    func seek(to seconds: Double) -> CameraVideoPlayback {
+        queue.sync {
+            let wanted = seconds.isFinite ? max(0, seconds) : 0
+            guard let movie, !stopped else {
+                pendingStart = wanted
+                return CameraVideoPlayback(playing: true, position: wanted, duration: nil)
+            }
+            let start = min(wanted, max(0, movie.duration - 0.001))
+            if pausedAt != nil { pausedAt = start }
+            rewind(at: start)
+            // From when the reader is ready: opening it can take a while.
+            loopStart = clock.now.advanced(by: .seconds(-start))
+            // The frame up now is from elsewhere in the movie: the next one decoded replaces it.
+            lastFraming = nil
+            return CameraVideoPlayback(playing: true, position: start, duration: movie.duration, paused: pausedAt != nil)
+        }
+    }
+
+    /// Seconds into the movie at this moment, the loop started at `loopStart`.
+    private func position(since loopStart: ContinuousClock.Instant, in movie: Movie) -> Double {
+        let elapsed = loopStart.duration(to: clock.now)
+        let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+        return movie.duration > 0 ? max(0, seconds.truncatingRemainder(dividingBy: movie.duration)) : 0
+    }
+
+    func start() {
+        let asset = self.asset
+        Task { [weak self] in
+            // Missing, corrupt or unsupported video: nothing is sent, and the
+            // VM keeps its own gray fallback.
+            guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+                  let duration = try? await asset.load(.duration), duration.isNumeric, duration.seconds > 0,
+                  let transform = try? await track.load(.preferredTransform),
+                  let naturalSize = try? await track.load(.naturalSize)
+            else { return }
+            let movie = Movie(track: track, duration: duration.seconds, orientation: Self.orientation(transform),
+                              naturalSize: naturalSize)
+            guard let self else { return }
+            queue.async { self.begin(movie) }
+        }
+    }
+
+    func stop() {
+        queue.sync {
+            stopped = true
+            timer?.cancel()
+            timer = nil
+            reader?.cancelReading()
+            reader = nil
+            output = nil
+            next = nil
+            lastPixels = nil
+        }
+    }
+
+    /// On `queue`: the movie is loaded; it plays from `startAt` (or where
+    /// it was moved meanwhile) now.
+    private func begin(_ movie: Movie) {
+        guard !stopped else { return }
+        self.movie = movie
+        let start = (pendingStart ?? startAt).truncatingRemainder(dividingBy: movie.duration)
+        pendingStart = nil
+        if startsPaused { pausedAt = start }
+        rewind(at: start)
+        // From when the reader is ready: opening it can take a while (a
+        // decoder's first start), and the movie would be past `start` by then.
+        loopStart = clock.now.advanced(by: .seconds(-start))
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / max(request.fps, 1)), leeway: .milliseconds(3))
+        timer.setEventHandler { [weak self] in self?.tick() }
+        self.timer = timer
+        timer.resume()
+    }
+
+    /// On `queue`: a new reader at the movie's beginning, or at `start`
+    /// seconds into it (zoomed in further than the reader decodes for).
+    private func rewind(at start: Double = 0) {
+        reader?.cancelReading()
+        reader = nil
+        output = nil
+        next = nil
+        guard let movie, let reader = try? AVAssetReader(asset: asset) else { return }
+        if start > 0 {
+            reader.timeRange = CMTimeRange(start: CMTime(seconds: start, preferredTimescale: 600), duration: .positiveInfinity)
+        }
+        var settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+        let zoom = framing().clampedZoom
+        let size = scaledDecoding ? Self.decodeSize(natural: movie.naturalSize, orientation: movie.orientation, request: request, zoom: zoom) : nil
+        decodedZoom = size == nil ? nil : max(1, zoom)
+        if let size {
+            // The decoder scales (in hardware where it can): a 4K movie is
+            // not decoded at 4K for a 720p camera.
+            settings[kCVPixelBufferWidthKey as String] = Int(size.width)
+            settings[kCVPixelBufferHeightKey as String] = Int(size.height)
+        }
+        let output = AVAssetReaderTrackOutput(track: movie.track, outputSettings: settings)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { return refuseScaling(size) }
+        reader.add(output)
+        guard reader.startReading() else { return refuseScaling(size) }
+        self.reader = reader
+        self.output = output
+    }
+
+    /// On `queue`: a reader that would not decode at `size` starts again
+    /// decoding as recorded (once; nothing more to try without a size).
+    private func refuseScaling(_ size: CGSize?) {
+        guard size != nil, scaledDecoding else { return }
+        logger.notice("camera video: the decoder does not scale this movie; it decodes at its own size")
+        scaledDecoding = false
+        rewind()
+    }
+
+    /// The size to decode a movie at: as small as the portrait the phone
+    /// shows (Android's frame turned, JPEGEncoder.sensorFrame) allows while
+    /// still covering it whichever way the movie is turned, and `zoom`
+    /// times more when zoomed in, in its own (unturned) orientation, even
+    /// sides; nil when the movie is no bigger than that.
+    static func decodeSize(natural: CGSize, orientation: CGImagePropertyOrientation, request: CameraFeed.Request,
+                           zoom: Double = 1) -> CGSize? {
+        guard natural.width > 0, natural.height > 0 else { return nil }
+        // The framing can turn the video a quarter at any time without a
+        // new reader (VideoFraming.rotation): cover the portrait either way.
+        let covering = { (picture: CGSize) in
+            max(CGFloat(request.height) / picture.width, CGFloat(request.width) / picture.height)
+        }
+        // Zoomed in, the part shown is that much smaller: decode that much more.
+        let scale = max(covering(natural), covering(CGSize(width: natural.height, height: natural.width))) * max(1, CGFloat(zoom))
+        guard scale < 1 else { return nil }
+        // Nearest even side (rounding up could turn 1280.0000001 into 1282).
+        func even(_ side: CGFloat) -> CGFloat { max(16, (side / 2).rounded() * 2) }
+        return CGSize(width: even(natural.width * scale), height: even(natural.height * scale))
+    }
+
+    /// On `queue`, once per frame Android wants.
+    private func tick() {
+        guard !stopped, let movie, var loopStart else { return }
+        let elapsed = loopStart.duration(to: clock.now)
+        var seconds = pausedAt ?? Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+        if pausedAt == nil, seconds >= movie.duration {
+            // The movie's end: the next loop starts where this one ended
+            // (more than one when the clock jumped, as after a sleep).
+            let loops = (seconds / movie.duration).rounded(.down)
+            loopStart = loopStart.advanced(by: .seconds(loops * movie.duration))
+            self.loopStart = loopStart
+            seconds -= loops * movie.duration
+            rewind()
+        }
+        // Zoomed in past what the reader decodes for: decode more from here on.
+        if let decodedZoom, self.framing().clampedZoom > decodedZoom + 0.01 {
+            rewind(at: seconds)
+            lastFraming = nil
+        }
+        let decodeStart = clock.now
+        if let frame = latestFrame(upTo: seconds) {
+            lastPixels = frame
+            newPixels = true
+            stats.decode += decodeStart.duration(to: clock.now)
+        }
+        let framing = self.framing()
+        if !encoding, newPixels || framing != lastFraming, let pixels = lastPixels {
+            // The encoder sends this tick's frame when it is done.
+            newPixels = false
+            encoding = true
+            startEncoding(Pixels(buffer: pixels), movie.orientation, framing)
+        } else if let last {
+            deliver(last)
+            stats.sent += 1
+        }
+        reportStats()
+    }
+
+    /// On `queue`: hands a picture to `encodeQueue`, which turns, frames and
+    /// encodes it, then sends it from `queue` (not after `stop`).
+    private func startEncoding(_ pixels: Pixels, _ orientation: CGImagePropertyOrientation, _ framing: VideoFraming) {
+        encodeQueue.async { [self] in
+            let start = clock.now
+            let jpeg = encode(pixels.buffer, orientation, framing)
+            let took = start.duration(to: clock.now)
+            queue.async { [self] in
+                encoding = false
+                guard !stopped else { return }
+                stats.encode += took
+                guard let jpeg else { return }
+                last = jpeg
+                lastFraming = framing
+                deliver(jpeg)
+                stats.sent += 1
+                stats.encoded += 1
+            }
+        }
+    }
+
+    /// On `queue`: every five seconds, what the camera sent and what that took.
+    private func reportStats() {
+        let now = clock.now
+        guard let since = statsSince else {
+            statsSince = now
+            return
+        }
+        let elapsed = since.duration(to: now)
+        guard elapsed >= .seconds(5) else { return }
+        let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+        func ms(_ total: Duration, _ count: Int) -> String {
+            let value = (Double(total.components.seconds) * 1000 + Double(total.components.attoseconds) / 1e15) / Double(max(count, 1))
+            return String(format: "%.1f", value)
+        }
+        let fps = String(format: "%.1f", Double(stats.sent) / seconds), newFPS = String(format: "%.1f", Double(stats.encoded) / seconds)
+        let decodeMs = ms(stats.decode, stats.encoded), encodeMs = ms(stats.encode, stats.encoded)
+        let asked = "\(request.fps) fps at \(request.width)×\(request.height)"
+        logger.debug("camera video: \(fps, privacy: .public) fps sent (\(newFPS, privacy: .public) new) for \(asked, privacy: .public); decode \(decodeMs, privacy: .public) ms, encode \(encodeMs, privacy: .public) ms a frame")
+        stats = (0, 0, .zero, .zero)
+        statsSince = now
+    }
+
+    /// On `queue`: decodes up to `seconds` into the movie and returns the
+    /// latest frame due by then, nil when none newer than the last is due.
+    private func latestFrame(upTo seconds: Double) -> CVPixelBuffer? {
+        var due: CVPixelBuffer?
+        while true {
+            if next == nil {
+                // At the end of the movie the reader is done, and asking it
+                // again raises (its status is no longer reading): the last
+                // frame stays up until the loop starts over.
+                guard let reader, reader.status == .reading else { break }
+                guard let sample = output?.copyNextSampleBuffer() else {
+                    // A decoder that took the size but cannot scale fails here.
+                    if reader.status == .failed, scaledDecoding {
+                        scaledDecoding = false
+                        logger.notice("camera video: decoding at the camera's size failed (\(String(describing: reader.error), privacy: .public)); decoding at the movie's own size")
+                        rewind()
+                        continue
+                    }
+                    break
+                }
+                next = sample
+            }
+            guard let sample = next else { break }
+            let time = CMSampleBufferGetPresentationTimeStamp(sample)
+            if time.isNumeric, time.seconds > seconds { break }
+            next = nil
+            if let pixels = CMSampleBufferGetImageBuffer(sample) { due = pixels }
+        }
+        return due
+    }
+
+    private func encode(_ pixels: CVPixelBuffer, _ orientation: CGImagePropertyOrientation, _ framing: VideoFraming) -> Data? {
+        let image = JPEGEncoder.turned(CIImage(cvPixelBuffer: pixels).oriented(orientation), quarterTurns: framing.quarterTurns)
+        return encoder.jpeg(JPEGEncoder.sensorFrame(image, width: request.width, height: request.height, framing: framing))
+    }
+
+    /// A track's preferred transform (how a player turns its picture
+    /// upright) as an image orientation: phones record portrait movies
+    /// sideways and say so here.
+    static func orientation(_ transform: CGAffineTransform) -> CGImagePropertyOrientation {
+        switch (transform.a, transform.b, transform.c, transform.d) {
+        case (0, 1, -1, 0): .right
+        case (0, -1, 1, 0): .left
+        case (-1, 0, 0, -1): .down
+        default: .up
+        }
+    }
+}
+
+/// An imported picture (CameraSource.isPicture), shown still at Android's
+/// rate. It is read once, upright as its EXIF orientation says and no
+/// larger than the closest zoom needs, and framed and encoded again only
+/// when its framing changes: every other frame is the same JPEG.
+final class PictureCamera: CameraProducer, @unchecked Sendable {
+    private let url: URL
+    private let request: CameraFeed.Request
+    private let deliver: @Sendable (Data) -> Void
+    /// How the picture fills Android's (CameraFeed.useFraming).
+    private let framing: @Sendable () -> VideoFraming
+    private let encoder = JPEGEncoder()
+    /// Everything below changes on `queue` only.
+    private let queue = DispatchQueue(label: "com.avodroid.cameras.picture")
+    private var timer: DispatchSourceTimer?
+    private var picture: CIImage?
+    private var last: Data?
+    private var lastFraming: VideoFraming?
+    private var stopped = false
+
+    init(path: String, request: CameraFeed.Request, deliver: @escaping @Sendable (Data) -> Void,
+         framing: @escaping @Sendable () -> VideoFraming = { VideoFraming() }) {
+        self.url = URL(fileURLWithPath: path)
+        self.request = request
+        self.deliver = deliver
+        self.framing = framing
+    }
+
+    func start() {
+        queue.async { [self] in
+            guard !stopped else { return }
+            // Missing or unreadable: nothing is sent, and the VM keeps its gray.
+            let longest = max(request.width, request.height) * Int(VideoFraming.zoomRange.upperBound.rounded(.up))
+            guard let picture = Self.load(url, longestSide: longest) else { return }
+            self.picture = picture
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / max(request.fps, 1)), leeway: .milliseconds(3))
+            timer.setEventHandler { [weak self] in self?.tick() }
+            self.timer = timer
+            timer.resume()
+        }
+    }
+
+    func stop() {
+        queue.sync {
+            stopped = true
+            timer?.cancel()
+            timer = nil
+        }
+    }
+
+    /// On `queue`, once per frame Android wants.
+    private func tick() {
+        guard !stopped, let picture else { return }
+        let framing = self.framing()
+        if last == nil || framing != lastFraming {
+            let turned = JPEGEncoder.turned(picture, quarterTurns: framing.quarterTurns)
+            last = encoder.jpeg(JPEGEncoder.sensorFrame(turned, width: request.width, height: request.height, framing: framing))
+            lastFraming = framing
+        }
+        if let last { deliver(last) }
+    }
+
+    /// The picture at `url`, upright, its longest side at most `longestSide`
+    /// (a 48-megapixel photo is not kept whole for a 720p camera).
+    static func load(_ url: URL, longestSide: Int) -> CIImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(16, longestSide),
+            kCGImageSourceShouldCacheImmediately: true,
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        return CIImage(cgImage: image)
     }
 }
 
@@ -362,7 +959,7 @@ final class DrawnCamera: CameraProducer, @unchecked Sendable {
     }
 
     private func tick() {
-        guard let image = Self.draw(picture, width: request.width, height: request.height, time: Date().timeIntervalSince(started)),
+        guard let image = Self.draw(picture, width: request.width, height: request.height, time: Date().timeIntervalSince(started), turned: true),
               let jpeg = Self.jpeg(image) else { return }
         deliver(jpeg)
     }
@@ -374,12 +971,21 @@ final class DrawnCamera: CameraProducer, @unchecked Sendable {
         return CGImageDestinationFinalize(destination) ? data as Data : nil
     }
 
-    static func draw(_ picture: Picture, width: Int, height: Int, time: TimeInterval) -> CGImage? {
+    /// A `width`×`height` picture; `turned`, as the turned sensor gives it
+    /// (JPEGEncoder.sensorFrame): drawn upright on the portrait
+    /// `height`×`width` and turned a quarter counterclockwise.
+    static func draw(_ picture: Picture, width: Int, height: Int, time: TimeInterval, turned: Bool = false) -> CGImage? {
         guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                                       space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                       bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
         else { return nil }
-        let (w, h) = (CGFloat(width), CGFloat(height))
+        var (w, h) = (CGFloat(width), CGFloat(height))
+        if turned {
+            // A point (x, y) of the upright picture lands at (width - y, x).
+            context.translateBy(x: w, y: 0)
+            context.rotate(by: .pi / 2)
+            (w, h) = (h, w)
+        }
         switch picture {
         case .scene(let camera):
             drawScene(context, w, h, time: time, camera: camera)

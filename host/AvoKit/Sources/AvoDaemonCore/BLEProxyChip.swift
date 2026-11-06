@@ -49,7 +49,12 @@ actor BLEProxyChip {
     /// A random static address (top two bits set), little-endian as HCI carries it.
     static func address(for id: UUID) -> [UInt8] {
         let bytes = withUnsafeBytes(of: id.uuid) { Array($0) }
-        var address = (0..<6).map { index in bytes[index] ^ bytes[index + 6] ^ bytes[(index + 12) % 16] }
+        // In steps: one expression of three XORs was too much for some compilers' type checker.
+        var address: [UInt8] = []
+        for index in 0..<6 {
+            let first: UInt8 = bytes[index] ^ bytes[index + 6]
+            address.append(first ^ bytes[(index + 12) % 16])
+        }
         address[5] |= 0xC0
         // All ones or all zeros in the random part are not allowed.
         if address[0..<5].allSatisfy({ $0 == 0xFF }) || (address[0..<5].allSatisfy({ $0 == 0 }) && address[5] == 0xC0) { address[0] ^= 0x5A }

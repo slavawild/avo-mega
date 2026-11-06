@@ -75,6 +75,8 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
     private var tasks: [Task<Void, Never>] = []
     /// The cameras the Mac feeds (CameraFeed), when Android has them.
     private var cameras: CameraFeed?
+    /// The camera whose imported video also supplies microphone audio.
+    private var soundtrackCamera: Int?
     /// The running start, and whether it booted Magisk's init_boot (RootEngine).
     private var launched: EngineLaunch?
     private var bootedWithMagisk = false
@@ -139,25 +141,43 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
         if case let .gpu(emulator) = gpu { gpuFlags = ["--gpu", "gfxstream", "--gfxstream-dir", emulator.directory.path] }
         // Android's data elsewhere (an external drive): the disks that belong
         // with it are there too; frames and logs stay on this Mac.
-        let disks = paths.dataDisks.standardizedFileURL.path == paths.instance.standardizedFileURL.path
+        let disks: [String] = paths.dataDisks.standardizedFileURL.path == paths.instance.standardizedFileURL.path
             ? [] : ["--disks", paths.dataDisks.path]
         // Display 0 is Android's own screen; app windows get their own displays.
-        return ["cuttlefish", images.path,
-                "--instance", paths.instance.path,
-                "--runtime", paths.runtime.path,
-                "--userdata", paths.dataDisk.path] + disks + [
-                "--cpus", "\(config.cpuCount)",
-                "--mem", "\(config.androidMemoryMiB(profile: launch.profile, host: host))",
-                "--display", "\(launch.androidScreen.width)x\(launch.androidScreen.height)",
-                "--density", "\(launch.androidScreen.dpi)",
-                "--properties", identityFile(paths).path]
-                + (launch.exitOnReboot ? ["--exit-on-reboot"] : [])
-                + gpuFlags + sharedFolderFlags(config) + refreshRateFlags(launch.displayRate)
-                + (bluetooth.map { ["--bluetooth", $0.path] } ?? [])
-                + (initBoot.map { ["--init-boot", $0.path] } ?? [])
-                + config.cameraFlags
-                + (config.microphoneEnabled ? [] : ["--no-microphone"])
-                + cpuFlags(launch) + hardwareFlags(launch)
+        // Built in steps: as one expression it is more than Swift's type
+        // checker takes in reasonable time on a slower Mac.
+        var arguments: [String] = ["cuttlefish", images.path,
+                                   "--instance", paths.instance.path,
+                                   "--runtime", paths.runtime.path,
+                                   "--userdata", paths.dataDisk.path]
+        arguments += disks
+        arguments += ["--cpus", "\(config.cpuCount)",
+                      "--mem", "\(config.androidMemoryMiB(profile: launch.profile, host: host))",
+                      "--display", "\(launch.androidScreen.width)x\(launch.androidScreen.height)",
+                      "--density", "\(launch.androidScreen.dpi)",
+                      "--properties", identityFile(paths).path]
+        if launch.exitOnReboot { arguments.append("--exit-on-reboot") }
+        arguments += gpuFlags
+        arguments += sharedFolderFlags(config)
+        arguments += refreshRateFlags(launch.displayRate)
+        if let bluetooth { arguments += ["--bluetooth", bluetooth.path] }
+        if let initBoot { arguments += ["--init-boot", initBoot.path] }
+        arguments += config.cameraFlags
+        if !config.microphoneEnabled { arguments.append("--no-microphone") }
+        arguments += cpuFlags(launch)
+        arguments += hardwareFlags(launch)
+        return arguments
+    }
+
+    /// `microphone sync <seconds>`: the soundtrack to that second of its movie.
+    static func soundtrackSyncCommand(_ seconds: Double) -> String {
+        "microphone sync " + String(format: "%.3f", seconds.isFinite ? max(0, seconds) : 0)
+    }
+
+    /// Audio for the Android mic: an imported video's PCM sidecar, or the Mac.
+    /// Control command takes the full absolute path including spaces.
+    static func videoMicrophoneCommand(_ config: VMConfig) -> String {
+        config.videoMicrophonePCMPath.map { "microphone file " + $0 } ?? "microphone mac"
     }
 
     /// "Emulate this phone's hardware": the profile's CPU for Android's
@@ -404,7 +424,18 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
                                         cellular: launch.config.cellularEnabled)
         await agent.sampleProcesses(lock.withLock { processSink })
         // Settings › Devices › Cameras: the Mac's cameras, or scenes, while Android streams them.
-        let cameras = launch.config.cameraFlags.isEmpty ? nil : CameraFeed(socketPath: controlPath, sources: launch.config.cameraSources)
+        let cameras = launch.config.cameraFlags.isEmpty ? nil : CameraFeed(socketPath: controlPath, sources: launch.config.cameraSources,
+                                                                               framing: launch.config.cameraVideoFraming) { [weak self] camera, seconds, paused in
+            // The movie starts (from its beginning, or where it was moved),
+            // moves, pauses or plays on: its soundtrack, when it is the
+            // microphone, does too. Not awaited: commands go one at a time,
+            // and the camera feed must not wait on them.
+            guard let self, camera == self.lock.withLock({ self.soundtrackCamera }) else { return }
+            Task {
+                try? await control.send(Self.soundtrackSyncCommand(seconds))
+                try? await control.send(paused ? "microphone pause" : "microphone play")
+            }
+        }
         let events = try control.events()
         let pump = Task {
             do {
@@ -414,7 +445,7 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
                     if line.hasPrefix("bluetooth hci "), let port = line.split(separator: " ").last.flatMap({ UInt16($0) }) {
                         await agent.useBluetoothPort(port)
                     }
-                    if line.hasPrefix("camera ") { cameras?.handle(line) }
+                    if line.hasPrefix("camera ") || line.hasPrefix("camerastats ") { cameras?.handle(line) }
                     if line.hasPrefix("disk ") { self.diskFull.handle(line) }
                     bridge.handle(line)
                 }
@@ -437,6 +468,7 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
             if stops != generation { return (false, nil) }
             self.process = process
             self.cameras = cameras
+            self.soundtrackCamera = launch.config.soundtrackCamera
             self.vsockPath = vsock
             self.control = control
             self.agent = agent
@@ -456,6 +488,7 @@ public final class VMMEngine: VMEngine, @unchecked Sendable {
             throw CancellationError()
         }
         if let location { try? await control.send(location.command) }
+        try? await control.send(Self.videoMicrophoneCommand(launch.config))
         // Settings › Devices › Network speed: the engine starts at full speed.
         if launch.config.networkSpeed != .full { try? await control.send(launch.config.networkSpeed.engineCommand) }
         // Settings › Devices › Mobile network: the modem starts without a SIM.
@@ -820,7 +853,12 @@ extension VMMEngine: WidgetsEngine {
 extension VMMEngine: DeviceSettingsEngine {
     public func applyDeviceSettings(_ config: VMConfig) async {
         let (control, agent, cameras) = lock.withLock { (self.control, self.agent, self.cameras) }
+        // Before the cameras switch: a video chosen while its camera streams
+        // starts over at once, and its soundtrack is found by this.
+        lock.withLock { soundtrackCamera = config.soundtrackCamera }
+        cameras?.useFraming(config.cameraVideoFraming)
         cameras?.use(config.cameraSources)
+        try? await control?.send(Self.videoMicrophoneCommand(config))
         try? await control?.send(config.microphoneEnabled ? "microphone on" : "microphone off")
         try? await control?.send(config.networkSpeed.engineCommand)
         try? await control?.send(config.cellularCommand)
@@ -1020,5 +1058,14 @@ extension VMMEngine: ActivityEngine {
 
     var engineProcessID: pid_t? {
         lock.withLock { process.flatMap { $0.isRunning ? $0.processIdentifier : nil } }
+    }
+}
+
+/// Settings › Devices › Cameras: where a camera's movie is, and moving it.
+extension VMMEngine: CameraVideoEngine {
+    func cameraVideoPlayback(camera: Int, seekTo seconds: Double?, paused: Bool?) async -> CameraVideoPlayback? {
+        let cameras = lock.withLock { self.cameras }
+        // Its soundtrack follows a move or a pause through CameraFeed's videoStarted.
+        return cameras?.videoPlayback(camera: camera, seekTo: seconds, paused: paused)
     }
 }

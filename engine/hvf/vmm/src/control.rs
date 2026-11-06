@@ -29,9 +29,14 @@
 //! cellular <gprs|edge|umts|hspa|lte|nr> <bars 0-4>   a SIM registered on that
 //!                                     network with that signal (modem.rs)
 //! cellular off                       no SIM
-//! microphone on|off                  whether Android may use the Mac's
-//!                                     microphone (virtio/sound.rs; off, it
-//!                                     records silence)
+//! microphone on|off                  whether Android may capture audio
+//!                                     (virtio/sound.rs; off, records silence)
+//! microphone mac|file <path>          use the Mac microphone or an imported
+//!                                     48 kHz stereo S16LE PCM soundtrack
+//! microphone sync [seconds]           start file audio over (or at that second of
+//!                                     the video) with the video camera
+//! microphone pause|play               the video is paused (file audio is silent
+//!                                     and stays where it is) or plays on
 //! tap <x> <y> / swipe <x1> <y1> <x2> <y2> [ms]   pixels of scanout 0 (debugging)
 //! pause                              stop the vCPUs (pause.rs); `ok` once none
 //!                                     runs guest code, an error when one does
@@ -167,6 +172,54 @@ fn parse_gamepad(words: &[&str]) -> Result<GamepadReport, String> {
 const SUBSCRIBER_BACKLOG: usize = 1024;
 
 /// The scanout of a `frame <index> <sequence>` line.
+/// A `microphone …` command.
+#[derive(Debug, PartialEq)]
+enum Microphone {
+    /// `on|off`: whether Android may record at all.
+    Allowed(bool),
+    /// `mac`: the Mac's microphone.
+    Mac,
+    /// `file <path>`: an imported video's soundtrack sidecar (48 kHz stereo
+    /// S16LE), by its absolute path, spaces and all.
+    File(String),
+    /// `sync [seconds]`: the video camera started its movie over, or
+    /// jumped to that second of it; so does its soundtrack.
+    Sync(f64),
+    /// `pause` (true) or `play`: the video camera's movie stopped where it
+    /// is, or goes on; its soundtrack, silent meanwhile, with it.
+    Paused(bool),
+}
+
+fn parse_microphone(line: &str) -> Result<Microphone, String> {
+    let usage = || "microphone on|off|mac|pause|play|sync [seconds]|file <path>".to_string();
+    let rest = line.trim().strip_prefix("microphone").ok_or_else(usage)?.trim_start();
+    let (word, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    match word {
+        "on" | "off" | "mac" | "pause" | "play" if !after.trim().is_empty() => Err(usage()),
+        "pause" => Ok(Microphone::Paused(true)),
+        "play" => Ok(Microphone::Paused(false)),
+        "on" => Ok(Microphone::Allowed(true)),
+        "off" => Ok(Microphone::Allowed(false)),
+        "mac" => Ok(Microphone::Mac),
+        "sync" => match after.trim() {
+            "" => Ok(Microphone::Sync(0.0)),
+            seconds => match seconds.parse::<f64>() {
+                Ok(seconds) if seconds.is_finite() && seconds >= 0.0 => Ok(Microphone::Sync(seconds)),
+                _ => Err(usage()),
+            },
+        },
+        "file" => {
+            // The rest of the line is the path: a file's name may hold spaces.
+            let path = after.trim();
+            if !path.starts_with('/') || !path.ends_with(".pcm") || path.len() <= "/.pcm".len() {
+                return Err("microphone file needs an imported soundtrack's absolute .pcm path".into());
+            }
+            Ok(Microphone::File(path.to_owned()))
+        }
+        _ => Err(usage()),
+    }
+}
+
 fn frame_scanout(line: &str) -> Option<&str> {
     line.strip_prefix("frame ")?.split(' ').next()
 }
@@ -393,11 +446,16 @@ impl Controls {
             Some("gamepad") => self.gamepad(parse_gamepad(&words[1..])?),
             Some("network") => crate::link::LINK.set(crate::link::Conditions::parse(&words[1..])?),
             Some("cellular") => crate::modem::CELLULAR.set(crate::modem::Service::parse(&words[1..])?),
-            Some("microphone") => crate::virtio::sound::MICROPHONE.set(match words.get(1).copied() {
-                Some("on") => true,
-                Some("off") => false,
-                _ => return Err("microphone on|off".into()),
-            }),
+            Some("microphone") => {
+                use crate::virtio::sound::MICROPHONE;
+                match parse_microphone(line)? {
+                    Microphone::Allowed(allowed) => MICROPHONE.set(allowed),
+                    Microphone::Mac => MICROPHONE.set_file(None),
+                    Microphone::Sync(seconds) => MICROPHONE.sync_video(seconds),
+                    Microphone::Paused(paused) => MICROPHONE.pause_video(paused),
+                    Microphone::File(path) => MICROPHONE.set_file(Some(path)),
+                }
+            }
             Some("location") => {
                 if words.get(1) == Some(&"off") {
                     self.gnss.set(None);
@@ -530,6 +588,26 @@ pub fn serve(path: &Path, controls: Arc<Controls>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microphone_commands_are_read_whole() {
+        assert_eq!(parse_microphone("microphone on"), Ok(Microphone::Allowed(true)));
+        assert_eq!(parse_microphone("microphone off"), Ok(Microphone::Allowed(false)));
+        assert_eq!(parse_microphone("microphone mac"), Ok(Microphone::Mac));
+        assert_eq!(parse_microphone("microphone sync"), Ok(Microphone::Sync(0.0)));
+        assert_eq!(parse_microphone("microphone sync 12.5"), Ok(Microphone::Sync(12.5)));
+        assert_eq!(parse_microphone("microphone pause"), Ok(Microphone::Paused(true)));
+        assert_eq!(parse_microphone("microphone play"), Ok(Microphone::Paused(false)));
+        // A path keeps its spaces, wherever the command's own spaces fall.
+        let path = "/Users/a b/Library/Application Support/Avo/CameraVideos/1/My  clip.pcm";
+        assert_eq!(parse_microphone(&format!("microphone file {path}")), Ok(Microphone::File(path.into())));
+        assert_eq!(parse_microphone(&format!("  microphone   file   {path}  ")), Ok(Microphone::File(path.into())));
+        for line in ["microphone", "microphone file", "microphone file clip.pcm", "microphone file /a/clip.mp4", "microphone file /.pcm",
+                     "microphone on now", "microphone loud", "microphones on", "microphone sync -1", "microphone sync soon",
+                     "microphone sync 1 2", "microphone sync inf", "microphone pause now"] {
+            assert!(parse_microphone(line).is_err(), "{line}");
+        }
+    }
 
     fn summary(events: &[Event]) -> Vec<(u16, i32)> {
         events.iter().map(|e| (e.code, e.value)).collect()

@@ -1,0 +1,137 @@
+name: Build Avo MP4 Camera (macOS)
+
+# Build only the tip of this development branch. A PR event previously
+# queued obsolete snapshots of its merge ref alongside newer commits.
+on:
+  push:
+    branches:
+      - feature/mp4-camera-source
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: macOS runner image
+        default: macos-26
+        type: choice
+        options: [macos-26, macos-15]
+
+permissions:
+  contents: read
+
+# Keep only the newest test build while the branch is being developed,
+# per runner image: a build queued on macos-15 and one on macos-26 can wait
+# side by side when GitHub is short of one of them.
+concurrency:
+  group: avo-mp4-camera-${{ github.ref }}-${{ inputs.runner || 'macos-26' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build for Apple Silicon
+    # macos-26 by default; running the workflow by hand can pick macos-15,
+    # which builds with its newest Xcode 26 (the step below) all the same.
+    runs-on: ${{ inputs.runner || 'macos-26' }}
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Use the newest Xcode 26
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XCODE" ]; then
+            echo "::error::No Xcode 26 on this runner; it has:"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+
+      - name: Check toolchain
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          swift --version
+
+      - name: Install build dependencies
+        run: |
+          brew install xcodegen cmake ninja
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build the optional GPU renderer
+        id: gfx
+        continue-on-error: true
+        run: make gfxstream
+
+      - name: Apply Avo's avo_kit patches (Swift 6.3 workaround)
+        run: scripts/patch-avo-kit.sh
+
+      - name: Test virtio-sound engine (no Hypervisor on GitHub runners)
+        run: |
+          # GitHub-hosted macOS runs inside a VM. Two machine::pause_tests
+          # invoke hv_vm_create() and fail with HV_UNSUPPORTED there.
+          # Compile the entire test binary, then run the sound, microphone and camera tests only.
+          cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm --no-run
+          cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm virtio::sound::
+          cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm control::tests::microphone
+          cargo test --manifest-path engine/hvf/Cargo.toml -p avo-vmm virtio::media::
+
+      - name: Test camera models and camera feed
+        run: |
+          cd host/AvoKit
+          swift test --filter CameraSettingsTests
+          swift test --filter CameraFeedTests
+          swift test --filter DeviceSettingsTests
+          swift test --filter GuestCameraTests
+
+      - name: Build Avo for Apple Silicon
+        run: |
+          set -o pipefail
+          mkdir -p build
+          # The Xcode phase that builds avo-vmm looks for cargo in ~/.cargo/bin
+          # unless told: the one the steps above used.
+          CARGO="$(command -v cargo)" make build 2>&1 | tee build/xcodebuild.log
+
+      - name: Verify app and package ZIP
+        run: |
+          set -euo pipefail
+          APP="build/DerivedData/Build/Products/Debug/Avo.app"
+          for file in "$APP/Contents/MacOS/Avo" "$APP/Contents/MacOS/avo-vmm"; do
+            if [ ! -x "$file" ]; then
+              echo "::error::Avo.app has no $(basename "$file")"
+              ls -la "$APP/Contents/MacOS" || true
+              grep -n -i -E "cargo|avo-vmm" build/xcodebuild.log | grep -i -E "warning|error" | head -20 || true
+              exit 1
+            fi
+          done
+          # The GPU renderer step may fail without failing the job: then
+          # Avo.app has none and Android draws in software. Make it plain.
+          if [ ! -d "$APP/Contents/Resources/gfxstream" ]; then
+            echo "::warning::Avo.app has no GPU renderer (the optional gfxstream build failed): Android will draw in software"
+          fi
+          codesign --verify --deep --strict "$APP"
+          ditto -c -k --keepParent "$APP" "build/Avo-MP4-Camera-macOS-arm64.zip"
+
+      - name: Upload installable Avo (unsigned test build)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Avo-MP4-Camera-macOS-arm64
+          path: build/Avo-MP4-Camera-macOS-arm64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log if anything fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Avo-MP4-Camera-build-log
+          path: |
+            build/xcodebuild.log
+            build/gfxstream-src/*log
+          if-no-files-found: ignore
+          retention-days: 14

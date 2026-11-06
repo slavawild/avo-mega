@@ -148,6 +148,15 @@ impl Hub {
         }
     }
 
+    /// Tells the subscribers how a stream went (`camerastats <index> …`,
+    /// virtio/media.rs): its own kind of event, so the sticky
+    /// `camera <index> on|off` stays what it is.
+    pub fn report(&self, event: String) {
+        if let Some(events) = self.events.lock().unwrap().as_ref() {
+            events(event);
+        }
+    }
+
     /// Wakes the devices' stream threads (one is stopping).
     pub fn wake(&self) {
         self.fed.notify_all();

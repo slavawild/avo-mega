@@ -39,6 +39,8 @@ use super::queue::{Chain, Queue};
 use super::{Active, Interrupt, VirtioDevice};
 use crate::memory::GuestMemory;
 use std::collections::VecDeque;
+use std::os::fd::AsRawFd;
+use std::fs::File;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -181,6 +183,10 @@ struct Stream {
     held: Option<Held>,
     /// Recorded bytes the guest has not taken yet.
     captured: VecDeque<u8>,
+    /// The optional looping video soundtrack; never recorded from Core Audio.
+    video_audio: Option<PCMVideoMic>,
+    /// When the requested file contains no sound, record silence, not the Mac mic.
+    video_mode: bool,
     /// Capture hands over silence until the slack is recorded again.
     priming: bool,
     audio: Option<Audio>,
@@ -229,20 +235,269 @@ struct Tag {
 
 static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 
+/// Immutable imported 48 kHz stereo S16LE audio, mapped on demand.
+/// Memory mapping does not load a long recording into process heap memory.
+struct PCMVideoMic {
+    data: *mut libc::c_void,
+    bytes: usize,
+    /// The next output frame's place in the soundtrack, in its own frames.
+    position: f64,
+    /// The low-pass for the rate Android records at (below 48 kHz).
+    filter: Option<Lowpass>,
+}
+// Only State's mutex owns and accesses this mapping.
+unsafe impl Send for PCMVideoMic {}
+
+/// The soundtrack sidecar's rate (VideoAudioExtractor).
+const SOUNDTRACK_RATE: u32 = 48_000;
+
+impl PCMVideoMic {
+    fn open(path: &str) -> Option<Self> {
+        let file = File::open(path).ok()?;
+        let bytes = usize::try_from(file.metadata().ok()?.len()).ok()?;
+        if bytes < 4 || bytes % 4 != 0 { return None; }
+        let data = unsafe { libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0) };
+        if data == libc::MAP_FAILED { return None; }
+        Some(Self { data, bytes, position: 0.0, filter: None })
+    }
+
+    fn sample(bytes: &[u8], frame: usize) -> (i16, i16) {
+        let offset = frame * 4;
+        (i16::from_le_bytes([bytes[offset], bytes[offset + 1]]),
+         i16::from_le_bytes([bytes[offset + 2], bytes[offset + 3]]))
+    }
+
+    /// Its frame `seconds` into it, wrapping past its end.
+    fn at(&self, seconds: f64) -> f64 {
+        let frames = (self.bytes / 4) as f64;
+        if frames == 0.0 || !seconds.is_finite() || seconds <= 0.0 {
+            return 0.0;
+        }
+        (seconds * f64::from(SOUNDTRACK_RATE)) % frames
+    }
+
+    fn render(&mut self, params: Params, count: usize) -> Vec<u8> {
+        let source = unsafe { std::slice::from_raw_parts(self.data.cast::<u8>(), self.bytes) };
+        resample(source, &mut self.position, &mut self.filter, params.rate, params.channels, count)
+    }
+}
+
+/// `count` bytes of S16LE at `rate` with `channels` from the looping 48 kHz
+/// stereo `source`, from `position` on (which moves on past them).
+///
+/// Below 48 kHz the soundtrack goes through `Lowpass` first: picking every
+/// n-th sample would fold everything above the new Nyquist frequency back
+/// into what Android hears (8 and 16 kHz calls hear it as hiss and
+/// whistles). At 48 kHz it goes over as it is.
+fn resample(source: &[u8], position: &mut f64, filter: &mut Option<Lowpass>, rate: u32, channels: u8, count: usize) -> Vec<u8> {
+    let frames = source.len() / 4;
+    let mut out = Vec::with_capacity(count);
+    if frames == 0 || rate == 0 {
+        out.resize(count, 0);
+        return out;
+    }
+    let channels = usize::from(channels).max(1);
+    let step = f64::from(SOUNDTRACK_RATE) / f64::from(rate);
+    if rate < SOUNDTRACK_RATE {
+        if filter.as_ref().map(|filter| filter.rate) != Some(rate) {
+            *filter = Some(Lowpass::new(rate));
+        }
+    } else {
+        *filter = None;
+    }
+    for _ in 0..count / (channels * 2) {
+        let (left, right) = match filter.as_ref() {
+            Some(filter) => filter.read(source, frames, *position),
+            None => interpolate(source, frames, *position),
+        };
+        if channels == 1 {
+            out.extend_from_slice(&pcm16((left + right) / 2.0).to_le_bytes());
+        } else {
+            out.extend_from_slice(&pcm16(left).to_le_bytes());
+            out.extend_from_slice(&pcm16(right).to_le_bytes());
+        }
+        *position = (*position + step) % frames as f64;
+    }
+    out.resize(count, 0);
+    out
+}
+
+/// The soundtrack between two of its frames (exact on a whole frame).
+fn interpolate(source: &[u8], frames: usize, position: f64) -> (f32, f32) {
+    let whole = position.floor();
+    let fraction = (position - whole) as f32;
+    let index = whole as usize % frames;
+    let (l0, r0) = PCMVideoMic::sample(source, index);
+    if fraction == 0.0 {
+        return (f32::from(l0), f32::from(r0));
+    }
+    let (l1, r1) = PCMVideoMic::sample(source, (index + 1) % frames);
+    (f32::from(l0) + (f32::from(l1) - f32::from(l0)) * fraction, f32::from(r0) + (f32::from(r1) - f32::from(r0)) * fraction)
+}
+
+fn pcm16(value: f32) -> i16 {
+    value.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
+}
+
+/// A windowed-sinc (Blackman) low-pass that reads the 48 kHz soundtrack at
+/// any place between its frames, for a lower rate: it passes up to 90% of
+/// that rate's Nyquist frequency and stops what lies above it, which would
+/// otherwise alias. Its taps are worked out once per rate, for `PHASES`
+/// places between two frames.
+struct Lowpass {
+    rate: u32,
+    /// Taps on each side of the place read.
+    half: usize,
+    /// `PHASES` rows of `2 * half` taps; row p reads p / PHASES of a frame
+    /// past a whole one, from `half - 1` frames before it on.
+    taps: Vec<f32>,
+}
+
+impl Lowpass {
+    const PHASES: usize = 256;
+    /// Zero crossings of the sinc kept on each side.
+    const ZEROS: f64 = 32.0;
+
+    fn new(rate: u32) -> Lowpass {
+        // The cutoff in cycles per soundtrack frame, and the sinc's spacing.
+        let cutoff = 0.9 * f64::from(rate) / (2.0 * f64::from(SOUNDTRACK_RATE));
+        let half = (Self::ZEROS / (2.0 * cutoff)).ceil() as usize;
+        let width = 2 * half;
+        let mut taps = Vec::with_capacity(Self::PHASES * width);
+        for phase in 0..Self::PHASES {
+            let fraction = phase as f64 / Self::PHASES as f64;
+            let row: Vec<f64> = (0..width)
+                .map(|j| {
+                    let t = j as f64 - (half as f64 - 1.0) - fraction;
+                    let x = 2.0 * cutoff * t;
+                    let sinc = if x == 0.0 { 1.0 } else { (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x) };
+                    let w = t / half as f64;
+                    let blackman = 0.42 + 0.5 * (std::f64::consts::PI * w).cos() + 0.08 * (2.0 * std::f64::consts::PI * w).cos();
+                    sinc * blackman.max(0.0)
+                })
+                .collect();
+            // Each row passes a steady level as it is (no gain, no ripple between phases).
+            let sum: f64 = row.iter().sum();
+            taps.extend(row.iter().map(|tap| (tap / sum) as f32));
+        }
+        Lowpass { rate, half, taps }
+    }
+
+    /// Left and right at `position` (soundtrack frames, looping).
+    fn read(&self, source: &[u8], frames: usize, position: f64) -> (f32, f32) {
+        let whole = position.floor();
+        let mut phase = ((position - whole) * Self::PHASES as f64).round() as usize;
+        let mut index = whole as isize;
+        if phase == Self::PHASES {
+            phase = 0;
+            index += 1;
+        }
+        let width = 2 * self.half;
+        let row = &self.taps[phase * width..(phase + 1) * width];
+        let first = index - self.half as isize + 1;
+        let (mut left, mut right) = (0.0f32, 0.0f32);
+        for (j, tap) in row.iter().enumerate() {
+            let (l, r) = PCMVideoMic::sample(source, (first + j as isize).rem_euclid(frames as isize) as usize);
+            left += tap * f32::from(l);
+            right += tap * f32::from(r);
+        }
+        (left, right)
+    }
+}
+
+impl Drop for PCMVideoMic {
+    fn drop(&mut self) { unsafe { libc::munmap(self.data, self.bytes); } }
+}
+
 /// Whether Android may use the Mac's microphone (Settings › Devices ›
 /// Microphone: `microphone on|off` on the control socket, `--no-microphone`
 /// from the start). Off, Android records silence and the microphone is never
 /// opened, so macOS never asks for it; turning it off closes one that is
 /// open. The process's: it lasts through guest reboots.
-pub static MICROPHONE: Microphone = Microphone { allowed: AtomicBool::new(true), devices: Mutex::new(Vec::new()) };
+pub static MICROPHONE: Microphone = Microphone {
+    allowed: AtomicBool::new(true),
+    video_paused: AtomicBool::new(false),
+    timeline: Mutex::new(None),
+    file: Mutex::new(None),
+    devices: Mutex::new(Vec::new()),
+};
+
+/// Where the video whose soundtrack is the microphone is: `seconds` into
+/// it at `since`, playing on from there, or held at `seconds` while paused
+/// (`since` none).
+#[derive(Clone, Copy, Debug)]
+struct Timeline {
+    seconds: f64,
+    since: Option<Instant>,
+}
+
+impl Timeline {
+    fn now(&self, at: Instant) -> f64 {
+        self.seconds + self.since.map_or(0.0, |since| at.saturating_duration_since(since).as_secs_f64())
+    }
+}
 
 pub struct Microphone {
     allowed: AtomicBool,
+    /// The video whose soundtrack is the microphone is paused: silence,
+    /// and the soundtrack stays where it is.
+    video_paused: AtomicBool,
+    /// Where that video is (`microphone sync`, `pause`, `play`): a recording
+    /// that starts later starts its soundtrack there, not at its beginning.
+    timeline: Mutex<Option<Timeline>>,
+    /// Imported video's audio path; selected before recording starts.
+    file: Mutex<Option<String>>,
     /// Every machine's sound device, to close its microphone.
     devices: Mutex<Vec<Weak<Mutex<State>>>>,
 }
 
 impl Microphone {
+    pub fn set_file(&self, path: Option<String>) {
+        let mut file = self.file.lock().unwrap();
+        if *file != path {
+            // Another video's (or none): where the last one was says nothing of it.
+            *self.timeline.lock().unwrap() = None;
+        }
+        *file = path;
+    }
+
+    /// Seconds into the video now, as the last sync, pause and play said.
+    fn video_seconds(&self) -> Option<f64> {
+        self.timeline.lock().unwrap().map(|timeline| timeline.now(Instant::now()))
+    }
+
+    fn file_path(&self) -> Option<String> { self.file.lock().unwrap().clone() }
+
+    /// Puts the active file soundtrack at `seconds` into its video (0 when
+    /// Android starts its camera, where the video starts; elsewhere when the
+    /// video is moved there), keeping both at the same moment even if
+    /// recording began earlier. Past its end it wraps, as the video loops.
+    pub fn sync_video(&self, seconds: f64) {
+        let since = (!self.video_paused()).then(Instant::now);
+        *self.timeline.lock().unwrap() = Some(Timeline { seconds, since });
+        let mut devices = self.devices.lock().unwrap();
+        devices.retain(|device| device.strong_count() > 0);
+        for state in devices.iter().filter_map(Weak::upgrade) {
+            if let Some(soundtrack) = state.lock().unwrap().streams[CAPTURE].video_audio.as_mut() {
+                soundtrack.position = soundtrack.at(seconds);
+            }
+        }
+    }
+
+    /// The video camera's movie paused (`microphone pause`) or plays on.
+    pub fn pause_video(&self, paused: bool) {
+        self.video_paused.store(paused, Ordering::Release);
+        let now = Instant::now();
+        if let Some(timeline) = self.timeline.lock().unwrap().as_mut() {
+            // Held where it is, or playing on from there.
+            *timeline = Timeline { seconds: timeline.now(now), since: (!paused).then_some(now) };
+        }
+    }
+
+    fn video_paused(&self) -> bool {
+        self.video_paused.load(Ordering::Acquire)
+    }
+
     pub fn allowed(&self) -> bool {
         self.allowed.load(Ordering::Acquire)
     }
@@ -449,16 +704,25 @@ impl Sound {
         let id = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
         let tag = Arc::new(Tag { state: Arc::downgrade(&self.state), stream, id });
         if stream == CAPTURE {
-            // Only with the microphone allowed does the daemon ask macOS for it.
-            if let Some(hook) = self.recording.as_ref().filter(|_| MICROPHONE.allowed()) {
-                hook();
+            let file_path = MICROPHONE.file_path();
+            // Do not ask macOS for microphone permission when a file is selected.
+            if file_path.is_none() {
+                if let Some(hook) = self.recording.as_ref().filter(|_| MICROPHONE.allowed()) { hook(); }
             }
-            // Recording runs on a clock from the first moment; the microphone
-            // joins in when it is up. Opening it can wait on macOS's permission
-            // prompt, which must not hold up this vCPU.
             self.install(stream, Audio::new(id, Some(tag.clone())));
+            {
+                let mut state = self.state.lock().unwrap();
+                let entry = &mut state.streams[CAPTURE];
+                entry.video_mode = file_path.is_some();
+                entry.video_audio = file_path.as_deref().and_then(PCMVideoMic::open);
+                // Recording starts where the video is now, not at its beginning.
+                if let (Some(soundtrack), Some(seconds)) = (entry.video_audio.as_mut(), MICROPHONE.video_seconds()) {
+                    soundtrack.position = soundtrack.at(seconds);
+                }
+                entry.priming = !entry.video_mode;
+            }
             spawn_clock(&self.state, stream, id, params);
-            if !muted() && MICROPHONE.allowed() {
+            if file_path.is_none() && !muted() && MICROPHONE.allowed() {
                 open_microphone(self.state.clone(), id, params, tag);
             }
         } else {
@@ -507,6 +771,8 @@ impl Sound {
         let State { active, streams, .. } = &mut *state;
         let entry = &mut streams[stream];
         entry.captured.clear();
+        entry.video_audio = None;
+        entry.video_mode = false;
         let held = entry.held.take();
         let pending: Vec<Chain> = entry.pending.drain(..).collect();
         if let Some(active) = active.as_mut() {
@@ -702,6 +968,15 @@ fn record_period(active: &mut Active, stream: &mut Stream, params: Params) {
     let Some(chain) = stream.pending.pop_front() else { return };
     let room = chain.writable_len().saturating_sub(STATUS_LEN);
     let needed = if stream.priming { room.max(params.capture_slack_bytes()) } else { room };
+    if stream.video_mode {
+        let data = if MICROPHONE.allowed() && !muted() && !MICROPHONE.video_paused() {
+            stream.video_audio.as_mut().map(|audio| audio.render(params, room)).unwrap_or_else(|| vec![0; room])
+        } else {
+            vec![0; room]
+        };
+        hand_back(active, RX, stream, chain, &data);
+        return;
+    }
     let data: Vec<u8> = if stream.captured.len() >= needed {
         stream.priming = false;
         stream.stats.played += 1;
@@ -1254,6 +1529,93 @@ extern "C" fn recorded(user: *mut c_void, queue: AudioQueueRef, buffer: *mut Aud
 mod tests {
     use super::*;
     use hvf::GuestRegion;
+
+    /// `frames` of 48 kHz stereo: `left(n)` on the left, silence on the right.
+    fn soundtrack(frames: usize, left: impl Fn(usize) -> f64) -> Vec<u8> {
+        (0..frames).flat_map(|n| {
+            let l = pcm16(left(n) as f32).to_le_bytes();
+            [l[0], l[1], 0, 0]
+        }).collect()
+    }
+
+    fn lefts(bytes: &[u8], channels: usize) -> Vec<f64> {
+        bytes.chunks_exact(2 * channels).map(|frame| f64::from(i16::from_le_bytes([frame[0], frame[1]]))).collect()
+    }
+
+    /// The level of a tone in `samples` (RMS), skipping the filter's start.
+    fn rms(samples: &[f64]) -> f64 {
+        let tail = &samples[samples.len() / 4..];
+        (tail.iter().map(|s| s * s).sum::<f64>() / tail.len() as f64).sqrt()
+    }
+
+    #[test]
+    fn the_soundtrack_goes_over_as_it_is_at_48_khz() {
+        let source = soundtrack(480, |n| n as f64 * 10.0);
+        let (mut position, mut filter) = (0.0, None);
+        let out = resample(&source, &mut position, &mut filter, 48_000, 2, 480 * 4);
+        assert_eq!(out, source);
+        assert!(filter.is_none());
+        // It loops: the next frame is the first again.
+        assert_eq!(position, 0.0);
+    }
+
+    #[test]
+    fn a_lower_rate_keeps_the_voice_and_stops_what_would_alias() {
+        let tone = |hz: f64| move |n: usize| 10_000.0 * (2.0 * std::f64::consts::PI * hz * n as f64 / 48_000.0).sin();
+        for (rate, kept, stopped) in [(8_000u32, 1_000.0, 7_000.0), (16_000, 3_000.0, 13_000.0), (44_100, 15_000.0, 23_000.0)] {
+            let frames = 48_000;
+            let level = |hz: f64| {
+                let source = soundtrack(frames, tone(hz));
+                let (mut position, mut filter) = (0.0, None);
+                let count = rate as usize / 2 * 2;
+                rms(&lefts(&resample(&source, &mut position, &mut filter, rate, 1, count), 1))
+            };
+            let full = 10_000.0 / 2.0f64.sqrt() / 2.0; // mono: left and silent right averaged
+            let (pass, stop) = (level(kept), level(stopped));
+            assert!((pass / full - 1.0).abs() < 0.05, "{rate} Hz: {kept} Hz at {pass} of {full}");
+            assert!(stop / full < 0.01, "{rate} Hz: {stopped} Hz at {stop} of {full}");
+        }
+    }
+
+    #[test]
+    fn a_steady_level_stays_the_same_through_the_filter() {
+        let source = soundtrack(4_800, |_| 1_234.0);
+        let (mut position, mut filter) = (0.0, None);
+        for value in lefts(&resample(&source, &mut position, &mut filter, 11_025, 2, 2_000 * 4), 2) {
+            assert_eq!(value, 1_234.0);
+        }
+    }
+
+    #[test]
+    fn the_video_timeline_plays_on_and_holds_when_paused() {
+        let start = Instant::now();
+        let playing = Timeline { seconds: 10.0, since: Some(start) };
+        assert_eq!(playing.now(start + Duration::from_millis(2_500)), 12.5);
+        assert_eq!(playing.now(start), 10.0);
+        let paused = Timeline { seconds: 10.0, since: None };
+        assert_eq!(paused.now(start + Duration::from_secs(60)), 10.0);
+    }
+
+    #[test]
+    fn a_soundtrack_goes_to_its_video_s_second_and_wraps() {
+        let path = std::env::temp_dir().join(format!("avo-soundtrack-{}.pcm", std::process::id()));
+        // Two seconds of 48 kHz stereo.
+        std::fs::write(&path, vec![0u8; 2 * 48_000 * 4]).unwrap();
+        let soundtrack = PCMVideoMic::open(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(soundtrack.at(1.5), 72_000.0);
+        assert_eq!(soundtrack.at(2.5), 24_000.0, "past its end it wraps, as the video loops");
+        assert_eq!(soundtrack.at(0.0), 0.0);
+        assert_eq!(soundtrack.at(-1.0), 0.0);
+        assert_eq!(soundtrack.at(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn pcm_video_sample_decodes_signed_stereo() {
+        let samples = [0x00, 0x80, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(PCMVideoMic::sample(&samples, 0), (i16::MIN, i16::MAX));
+        assert_eq!(PCMVideoMic::sample(&samples, 1), (0, 0));
+    }
 
     #[test]
     fn describes_one_playback_and_one_capture_stream() {

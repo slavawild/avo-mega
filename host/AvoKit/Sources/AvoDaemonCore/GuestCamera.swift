@@ -23,7 +23,8 @@ import Foundation
 /// faces back, video2 front, anything else stays external. The copy also
 /// reads its configuration from Avo's folder instead of /vendor/etc:
 /// cameras 0 (back) and 1 (front) as on a phone, every size at 30 frames a
-/// second, v4l2loopback left out.
+/// second, v4l2loopback left out, and sensors turned a quarter as a phone's
+/// are (`CameraFeed.sensorOrientation`).
 ///
 /// Every boot with those cameras, when the nodes are the engine's devices
 /// in that order, the copy is bind-mounted over the APEX's file (the image
@@ -141,6 +142,10 @@ enum GuestCamera {
                 </ignore>
             </Provider>
             <Device>
+                <!-- Turned as on a phone: frames come a quarter turned, and apps turn them
+                     upright (CameraFeed.sensorOrientation); photos say how to show them.
+                     No apostrophes here: this goes through printf in single quotes. -->
+                <Orientation degree="90"/>
                 <NumVideoBuffers count="4"/>
                 <NumStillBuffers count="2"/>
                 <FpsList>

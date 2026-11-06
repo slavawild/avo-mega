@@ -433,6 +433,18 @@ final class ClientConnection: NSObject, AvoDaemonXPC, @unchecked Sendable {
         run(reply) { [self] in try await core.shakeDevice(client: id) }
     }
 
+    func cameraVideoPlayback(_ request: Data, reply: @escaping @Sendable (Data?, NSError?) -> Void) {
+        guard isAdmitted else { return reply(nil, AvoXPC.nsError(AvoError.unauthorizedCaller)) }
+        Task { [self] in
+            do {
+                let seek = try AvoXPC.decode(CameraVideoSeek.self, from: request)
+                reply(try await core.cameraVideoPlayback(seek, client: id).map { AvoXPC.encode($0) }, nil)
+            } catch {
+                reply(nil, AvoXPC.nsError(AvoError.reported(error)))
+            }
+        }
+    }
+
     func androidVolume(reply: @escaping @Sendable (Data?, NSError?) -> Void) {
         run(reply) { [self] in AvoXPC.encode(try await core.androidVolume(client: id)) }
     }
